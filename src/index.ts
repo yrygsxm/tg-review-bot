@@ -82,6 +82,17 @@ interface SubmissionPayload {
   mediaUniqueId: string | null;
 }
 
+interface PendingSubmissionRow {
+  user_id: number;
+  user_chat_id: number;
+  source_message_id: number;
+  content_type: SubmissionContentType;
+  content_text: string | null;
+  media_file_id: string | null;
+  media_unique_id: string | null;
+  created_at: string;
+}
+
 interface InlineKeyboardButton {
   text: string;
   callback_data?: string;
@@ -173,6 +184,8 @@ interface MiniAppAuth {
 interface MiniAppSubmitInput {
   text?: unknown;
   displaySender?: unknown;
+  imageDataUrl?: unknown;
+  imageSize?: unknown;
 }
 
 interface MiniAppModerationInput {
@@ -191,8 +204,10 @@ const WEBHOOK_PATH = "/telegram/webhook";
 const ROOT_PATH = "/";
 const APP_PATH = "/app";
 const HEALTH_PATH = "/health";
-const USER_CALLBACK_MODE = "u:sm";
+const DIRECT_SUBMISSION_CONFIRM = "u:direct";
 const MINI_APP_AUTH_MAX_AGE_SECONDS = 24 * 60 * 60;
+const DEFAULT_SUBMISSION_INTERVAL_SECONDS = 60 * 60;
+const MAX_MINI_APP_IMAGE_BYTES = 1024 * 1024;
 
 export default {
   async fetch(request, env): Promise<Response> {
@@ -219,6 +234,7 @@ export default {
       const update = (await request.json()) as TelegramUpdate;
 
       try {
+        await ensureRuntimeTables(env);
         await ensureSuperadmins(env);
         const config = getConfig(env);
         await handleUpdate(update, env, config);
@@ -246,6 +262,7 @@ export default {
 
 async function handleMiniAppApi(request: Request, env: Env, url: URL): Promise<Response> {
   try {
+    await ensureRuntimeTables(env);
     await ensureSuperadmins(env);
     const config = getConfig(env);
     const auth = await authenticateMiniAppRequest(request, env, config);
@@ -403,7 +420,7 @@ async function handleMessage(message: TelegramMessage, env: Env, config: AppConf
   }
 
   if (message.chat.type === "private") {
-    await sendMessage(env, message.chat.id, "发送 /submit 开始投稿，发送 /help 查看可用指令。");
+    await handleDirectPrivateSubmissionCandidate(message, env);
   }
 }
 
@@ -420,7 +437,15 @@ async function handleCommand(
   }
 
   switch (command) {
-    case "start":
+    case "start": {
+      await sendMessage(
+        env,
+        message.chat.id,
+        "发送 /submit 打开投稿入口；也可以直接把文字、图片、视频或文件发给我，我会询问是否作为投稿提交。",
+        message.chat.type === "private" ? buildMiniAppLaunchKeyboard(config) : undefined
+      );
+      return;
+    }
     case "help": {
       await sendMessage(
         env,
@@ -452,21 +477,9 @@ async function handleCommand(
       await sendMessage(
         env,
         message.chat.id,
-        "请选择这次投稿是否显示投稿人：",
-        buildUserSubmissionModeKeyboard(config)
+        "打开小程序投稿，或直接把投稿内容发给我后确认提交。",
+        buildMiniAppLaunchKeyboard(config)
       );
-      return;
-    }
-    case "submit_show":
-    case "submit_hide": {
-      if (message.chat.type !== "private") {
-        await sendMessage(env, message.chat.id, "投稿只能在私聊里发给机器人。");
-        return;
-      }
-
-      const displaySender = command === "submit_show" ? 1 : 0;
-      await upsertUserSession(env, actor.id, "awaiting_submission", displaySender);
-      await sendMessage(env, message.chat.id, "请发送投稿内容。发送 /cancel 可取消本次投稿。");
       return;
     }
   }
@@ -539,6 +552,22 @@ async function handleCommand(
       await sendMessage(env, message.chat.id, `已删除黑名单关键词 #${keywordId}`);
       return;
     }
+    case "set_rate_limit": {
+      requireArgument(args, "请提供投稿间隔分钟数，例如：/set_rate_limit 60");
+      const minutes = Number.parseFloat(args);
+      if (!Number.isFinite(minutes) || minutes < 0) {
+        throw new UserVisibleError("投稿间隔必须是大于或等于 0 的数字，单位是分钟。");
+      }
+      const seconds = Math.round(minutes * 60);
+      await setSubmissionIntervalSeconds(env, seconds, actor.id);
+      await sendMessage(env, message.chat.id, `已设置投稿间隔：${formatDuration(seconds)}。`);
+      return;
+    }
+    case "rate_limit": {
+      const seconds = await getSubmissionIntervalSeconds(env);
+      await sendMessage(env, message.chat.id, `当前投稿间隔：${formatDuration(seconds)}。`);
+      return;
+    }
     case "add_admin": {
       if (!isSuperadmin) {
         throw new UserVisibleError("只有超级管理员可以添加管理员。");
@@ -589,8 +618,8 @@ async function handleCallbackQuery(
   }
 
   try {
-    if (data.startsWith(USER_CALLBACK_MODE)) {
-      await handleUserModeCallback(callbackQuery, env);
+    if (data.startsWith(DIRECT_SUBMISSION_CONFIRM)) {
+      await handleDirectSubmissionCallback(callbackQuery, env, config);
       return;
     }
 
@@ -751,27 +780,104 @@ async function handleCallbackQuery(
   }
 }
 
-async function handleUserModeCallback(callbackQuery: TelegramCallbackQuery, env: Env): Promise<void> {
-  const selection = callbackQuery.data?.split(":")[2];
-  if (!callbackQuery.message) {
-    await answerCallbackQuery(env, callbackQuery.id);
+async function handleDirectSubmissionCallback(
+  callbackQuery: TelegramCallbackQuery,
+  env: Env,
+  config: AppConfig
+): Promise<void> {
+  const data = callbackQuery.data ?? "";
+  const parts = data.split(":");
+  const action = parts[2] ?? "";
+  const sourceMessageId = Number.parseInt(parts[3] ?? "", 10);
+  const userId = callbackQuery.from.id;
+
+  if (action !== "submit" && action !== "cancel") {
+    await answerCallbackQuery(env, callbackQuery.id, "未知操作。", true);
     return;
   }
 
-  if (callbackQuery.message.chat.type !== "private") {
-    await answerCallbackQuery(env, callbackQuery.id, "请在私聊里投稿。", true);
+  const pending = await getPendingSubmission(env, userId);
+  if (!pending) {
+    await answerCallbackQuery(env, callbackQuery.id, "找不到待确认投稿，请重新发送内容。", true);
     return;
   }
 
-  const displaySender = selection === "1" ? 1 : 0;
-  await upsertUserSession(env, callbackQuery.from.id, "awaiting_submission", displaySender);
-  await answerCallbackQuery(env, callbackQuery.id, "设置成功。");
+  if (!Number.isNaN(sourceMessageId) && pending.source_message_id !== sourceMessageId) {
+    await answerCallbackQuery(env, callbackQuery.id, "这条确认已过期，请点击最新确认按钮。", true);
+    return;
+  }
+
+  if (action === "cancel") {
+    await deletePendingSubmission(env, userId);
+    await answerCallbackQuery(env, callbackQuery.id, "已取消。");
+    if (callbackQuery.message) {
+      await editReplyMarkup(env, callbackQuery.message.chat.id, callbackQuery.message.message_id, {
+        inline_keyboard: []
+      });
+    }
+    return;
+  }
+
+  const rateLimit = await getUserRateLimitState(env, userId);
+  if (!rateLimit.allowed) {
+    await answerCallbackQuery(env, callbackQuery.id, `投稿过于频繁，请 ${formatDuration(rateLimit.remainingSeconds)} 后再试。`, true);
+    return;
+  }
+
+  const payload: SubmissionPayload = {
+    contentType: pending.content_type,
+    contentText: pending.content_text,
+    mediaFileId: pending.media_file_id,
+    mediaUniqueId: pending.media_unique_id
+  };
+  const syntheticMessage: TelegramMessage = {
+    message_id: pending.source_message_id,
+    from: callbackQuery.from,
+    chat: {
+      id: pending.user_chat_id,
+      type: "private"
+    },
+    text: pending.content_type === "text" ? pending.content_text ?? undefined : undefined,
+    caption: pending.content_type !== "text" ? pending.content_text ?? undefined : undefined
+  };
+
+  await submitPayloadToReview(env, callbackQuery.from, syntheticMessage, payload, 0, config);
+  await deletePendingSubmission(env, userId);
+  await answerCallbackQuery(env, callbackQuery.id, "已提交审核。");
+  if (callbackQuery.message) {
+    await editReplyMarkup(env, callbackQuery.message.chat.id, callbackQuery.message.message_id, {
+      inline_keyboard: []
+    });
+  }
+}
+
+async function handleDirectPrivateSubmissionCandidate(
+  message: TelegramMessage,
+  env: Env
+): Promise<void> {
+  const actor = message.from;
+  if (!actor) {
+    return;
+  }
+
+  const payload = extractSubmissionPayload(message);
+  if (!payload) {
+    await sendMessage(env, message.chat.id, "发送 /submit 打开投稿入口，或直接发送文字、图片、视频、文件后确认投稿。");
+    return;
+  }
+
+  const rateLimit = await getUserRateLimitState(env, actor.id);
+  if (!rateLimit.allowed) {
+    await sendMessage(env, message.chat.id, `投稿过于频繁，请 ${formatDuration(rateLimit.remainingSeconds)} 后再试。`);
+    return;
+  }
+
+  await upsertPendingSubmission(env, actor.id, message.chat.id, message.message_id, payload);
   await sendMessage(
     env,
-    callbackQuery.message.chat.id,
-    displaySender
-      ? "本次投稿会显示投稿人，请发送要投稿的内容。"
-      : "本次投稿将匿名发送，请发送要投稿的内容。"
+    message.chat.id,
+    "检测到你发送了投稿内容，是否提交审核？",
+    buildDirectSubmissionConfirmKeyboard(message.message_id)
   );
 }
 
@@ -791,6 +897,12 @@ async function handleUserSubmissionMessage(
     return;
   }
 
+  const rateLimit = await getUserRateLimitState(env, actor.id);
+  if (!rateLimit.allowed) {
+    await sendMessage(env, message.chat.id, `投稿过于频繁，请 ${formatDuration(rateLimit.remainingSeconds)} 后再试。`);
+    return;
+  }
+
   const submissionPayload = extractSubmissionPayload(message);
   if (!submissionPayload) {
     await sendMessage(
@@ -801,37 +913,15 @@ async function handleUserSubmissionMessage(
     return;
   }
 
-  const blacklistMatch = await findBlacklistMatch(env, submissionPayload.contentText);
-  if (blacklistMatch) {
-    await createSubmission(env, actor, message, userSession.display_sender, submissionPayload, "auto_rejected", blacklistMatch);
-    await deleteUserSession(env, actor.id);
-    await sendMessage(env, message.chat.id, "你的投稿命中了黑名单关键词，已被系统自动驳回。");
-    return;
-  }
-
-  const submissionId = await createSubmission(
+  await submitPayloadToReview(
     env,
     actor,
     message,
-    userSession.display_sender,
     submissionPayload,
-    "pending",
-    null
+    userSession.display_sender,
+    config
   );
-  const submission = await getSubmission(env, submissionId);
-  if (!submission) {
-    throw new Error("Submission was created but could not be reloaded.");
-  }
-
-  const reviewMessage = await sendSubmissionToReviewChat(env, submission, config.reviewChatId);
-  await env.DB.prepare(
-    "UPDATE submissions SET review_chat_id = ?, review_message_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
-  )
-    .bind(config.reviewChatId, reviewMessage.message_id, submission.id)
-    .run();
-
   await deleteUserSession(env, actor.id);
-  await sendMessage(env, message.chat.id, `投稿已提交，编号 #${submission.id}，请等待管理员审核。`);
 }
 
 async function handleAdminSessionMessage(
@@ -891,15 +981,41 @@ async function submitFromMiniApp(
   input: MiniAppSubmitInput,
   config: AppConfig
 ): Promise<{ submission: ReturnType<typeof serializeSubmission>; autoRejected: boolean; reason: string | null }> {
+  const rateLimit = await getUserRateLimitState(env, user.id);
+  if (!rateLimit.allowed) {
+    throw new ApiError(`投稿过于频繁，请 ${formatDuration(rateLimit.remainingSeconds)} 后再试。`, 429);
+  }
+
   const contentText = normalizeRequiredText(input.text, "请填写投稿正文。");
+  const imageDataUrl = normalizeMiniAppImageDataUrl(input.imageDataUrl, input.imageSize);
   const displaySender = input.displaySender === true ? 1 : 0;
   const payload: SubmissionPayload = {
-    contentType: "text",
+    contentType: imageDataUrl ? "photo" : "text",
     contentText,
-    mediaFileId: null,
+    mediaFileId: imageDataUrl,
     mediaUniqueId: null
   };
   const message = buildSyntheticSubmissionMessage(user, contentText);
+
+  const submissionId = await submitPayloadToReview(env, user, message, payload, displaySender, config);
+  const submission = await mustGetSubmission(env, submissionId);
+
+  return {
+    submission: serializeSubmission(submission),
+    autoRejected: submission.status === "auto_rejected",
+    reason: submission.rejection_reason
+  };
+}
+
+async function submitPayloadToReview(
+  env: Env,
+  user: TelegramUser,
+  message: TelegramMessage,
+  payload: SubmissionPayload,
+  displaySender: number,
+  config: AppConfig
+): Promise<number> {
+  const contentText = payload.contentText;
   const blacklistMatch = await findBlacklistMatch(env, contentText);
 
   if (blacklistMatch) {
@@ -912,37 +1028,33 @@ async function submitFromMiniApp(
       "auto_rejected",
       blacklistMatch
     );
-    const submission = await mustGetSubmission(env, submissionId);
-    await safelyRun("notify mini app auto rejection", () =>
-      sendMessage(env, user.id, "你的投稿命中了黑名单关键词，已被系统自动驳回。").then(() => undefined)
+    await safelyRun("notify auto rejection", () =>
+      sendMessage(env, message.chat.id, "你的投稿命中了黑名单关键词，已被系统自动驳回。").then(() => undefined)
     );
-
-    return {
-      submission: serializeSubmission(submission),
-      autoRejected: true,
-      reason: blacklistMatch
-    };
+    return submissionId;
   }
 
   const submissionId = await createSubmission(env, user, message, displaySender, payload, "pending", null);
   const submission = await mustGetSubmission(env, submissionId);
   const reviewMessage = await sendSubmissionToReviewChat(env, submission, config.reviewChatId);
+  const mediaRef = extractMediaRefFromMessage(reviewMessage, submission.content_type);
 
   await env.DB.prepare(
-    "UPDATE submissions SET review_chat_id = ?, review_message_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+    `UPDATE submissions
+     SET review_chat_id = ?,
+         review_message_id = ?,
+         media_file_id = COALESCE(?, media_file_id),
+         media_unique_id = COALESCE(?, media_unique_id),
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`
   )
-    .bind(config.reviewChatId, reviewMessage.message_id, submission.id)
+    .bind(config.reviewChatId, reviewMessage.message_id, mediaRef?.fileId ?? null, mediaRef?.uniqueId ?? null, submission.id)
     .run();
 
-  await safelyRun("notify mini app submission accepted", () =>
-    sendMessage(env, user.id, `投稿已提交，编号 #${submission.id}，请等待管理员审核。`).then(() => undefined)
+  await safelyRun("notify submission accepted", () =>
+    sendMessage(env, message.chat.id, `投稿已提交，编号 #${submission.id}，请等待管理员审核。`).then(() => undefined)
   );
-
-  return {
-    submission: serializeSubmission(await mustGetSubmission(env, submissionId)),
-    autoRejected: false,
-    reason: null
-  };
+  return submissionId;
 }
 
 function buildSyntheticSubmissionMessage(user: MiniAppUser, text: string): TelegramMessage {
@@ -1042,11 +1154,7 @@ async function publishToChannel(
     case "text":
       return sendMessage(env, targetChannelId, text);
     case "photo":
-      return telegramApi<TelegramMessage>(env, "sendPhoto", {
-        chat_id: targetChannelId,
-        photo: submission.media_file_id,
-        caption: text || undefined
-      });
+      return sendPhoto(env, targetChannelId, requireMediaFileId(submission), text || undefined);
     case "video":
       return telegramApi<TelegramMessage>(env, "sendVideo", {
         chat_id: targetChannelId,
@@ -1148,12 +1256,7 @@ async function sendSubmissionToReviewChat(
     case "text":
       return sendMessage(env, reviewChatId, reviewText, replyMarkup);
     case "photo":
-      return telegramApi<TelegramMessage>(env, "sendPhoto", {
-        chat_id: reviewChatId,
-        photo: submission.media_file_id,
-        caption: reviewText,
-        reply_markup: replyMarkup
-      });
+      return sendPhoto(env, reviewChatId, requireMediaFileId(submission), reviewText, replyMarkup);
     case "video":
       return telegramApi<TelegramMessage>(env, "sendVideo", {
         chat_id: reviewChatId,
@@ -1223,6 +1326,35 @@ function extractSubmissionPayload(message: TelegramMessage): SubmissionPayload |
       contentText: caption,
       mediaFileId: message.document.file_id,
       mediaUniqueId: message.document.file_unique_id
+    };
+  }
+
+  return null;
+}
+
+function extractMediaRefFromMessage(
+  message: TelegramMessage,
+  contentType: SubmissionContentType
+): { fileId: string; uniqueId: string } | null {
+  if (contentType === "photo" && message.photo?.length) {
+    const photo = message.photo[message.photo.length - 1];
+    return {
+      fileId: photo.file_id,
+      uniqueId: photo.file_unique_id
+    };
+  }
+
+  if (contentType === "video" && message.video) {
+    return {
+      fileId: message.video.file_id,
+      uniqueId: message.video.file_unique_id
+    };
+  }
+
+  if (contentType === "document" && message.document) {
+    return {
+      fileId: message.document.file_id,
+      uniqueId: message.document.file_unique_id
     };
   }
 
@@ -1362,6 +1494,31 @@ async function ensureSuperadmins(env: Env): Promise<void> {
   await env.DB.batch(ids.map((id) => statement.bind(id)));
 }
 
+async function ensureRuntimeTables(env: Env): Promise<void> {
+  await env.DB.batch([
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_by INTEGER,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`
+    ),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS pending_user_submissions (
+        user_id INTEGER PRIMARY KEY,
+        user_chat_id INTEGER NOT NULL,
+        source_message_id INTEGER NOT NULL,
+        content_type TEXT NOT NULL,
+        content_text TEXT,
+        media_file_id TEXT,
+        media_unique_id TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`
+    )
+  ]);
+}
+
 async function listRejectionReasons(env: Env): Promise<RejectionReasonRow[]> {
   const result = await env.DB.prepare("SELECT id, reason FROM rejection_reasons ORDER BY id ASC")
     .run<RejectionReasonRow>();
@@ -1391,32 +1548,122 @@ async function findBlacklistMatch(env: Env, text: string | null): Promise<string
   return null;
 }
 
+async function getSubmissionIntervalSeconds(env: Env): Promise<number> {
+  const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'submission_interval_seconds' LIMIT 1")
+    .first<{ value: string }>();
+  const seconds = row ? Number.parseInt(row.value, 10) : DEFAULT_SUBMISSION_INTERVAL_SECONDS;
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : DEFAULT_SUBMISSION_INTERVAL_SECONDS;
+}
+
+async function setSubmissionIntervalSeconds(env: Env, seconds: number, adminId: number): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO app_settings (key, value, updated_by, updated_at)
+     VALUES ('submission_interval_seconds', ?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       updated_by = excluded.updated_by,
+       updated_at = CURRENT_TIMESTAMP`
+  )
+    .bind(String(seconds), adminId)
+    .run();
+}
+
+async function getUserRateLimitState(
+  env: Env,
+  userId: number
+): Promise<{ allowed: true; remainingSeconds: 0 } | { allowed: false; remainingSeconds: number }> {
+  const intervalSeconds = await getSubmissionIntervalSeconds(env);
+  if (intervalSeconds <= 0) {
+    return { allowed: true, remainingSeconds: 0 };
+  }
+
+  const row = await env.DB.prepare(
+    `SELECT created_at
+     FROM submissions
+     WHERE user_id = ?
+     ORDER BY datetime(created_at) DESC
+     LIMIT 1`
+  )
+    .bind(userId)
+    .first<{ created_at: string }>();
+
+  if (!row) {
+    return { allowed: true, remainingSeconds: 0 };
+  }
+
+  const lastSubmittedAt = Date.parse(`${row.created_at.replace(" ", "T")}Z`);
+  if (Number.isNaN(lastSubmittedAt)) {
+    return { allowed: true, remainingSeconds: 0 };
+  }
+
+  const elapsedSeconds = Math.floor((Date.now() - lastSubmittedAt) / 1000);
+  const remainingSeconds = intervalSeconds - elapsedSeconds;
+  return remainingSeconds > 0
+    ? { allowed: false, remainingSeconds }
+    : { allowed: true, remainingSeconds: 0 };
+}
+
 async function getUserSession(env: Env, userId: number): Promise<UserSessionRow | null> {
   return env.DB.prepare("SELECT user_id, action, display_sender FROM user_sessions WHERE user_id = ? LIMIT 1")
     .bind(userId)
     .first<UserSessionRow>();
 }
 
-async function upsertUserSession(
+async function deleteUserSession(env: Env, userId: number): Promise<void> {
+  await env.DB.prepare("DELETE FROM user_sessions WHERE user_id = ?").bind(userId).run();
+}
+
+async function getPendingSubmission(env: Env, userId: number): Promise<PendingSubmissionRow | null> {
+  return env.DB.prepare(
+    `SELECT user_id, user_chat_id, source_message_id, content_type, content_text, media_file_id, media_unique_id, created_at
+     FROM pending_user_submissions
+     WHERE user_id = ?
+     LIMIT 1`
+  )
+    .bind(userId)
+    .first<PendingSubmissionRow>();
+}
+
+async function upsertPendingSubmission(
   env: Env,
   userId: number,
-  action: UserSessionAction,
-  displaySender: number
+  chatId: number,
+  sourceMessageId: number,
+  payload: SubmissionPayload
 ): Promise<void> {
   await env.DB.prepare(
-    `INSERT INTO user_sessions (user_id, action, display_sender)
-     VALUES (?, ?, ?)
-     ON CONFLICT(user_id) DO UPDATE SET
-       action = excluded.action,
-       display_sender = excluded.display_sender,
-       updated_at = CURRENT_TIMESTAMP`
+    `INSERT INTO pending_user_submissions (
+      user_id,
+      user_chat_id,
+      source_message_id,
+      content_type,
+      content_text,
+      media_file_id,
+      media_unique_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      user_chat_id = excluded.user_chat_id,
+      source_message_id = excluded.source_message_id,
+      content_type = excluded.content_type,
+      content_text = excluded.content_text,
+      media_file_id = excluded.media_file_id,
+      media_unique_id = excluded.media_unique_id,
+      created_at = CURRENT_TIMESTAMP`
   )
-    .bind(userId, action, displaySender)
+    .bind(
+      userId,
+      chatId,
+      sourceMessageId,
+      payload.contentType,
+      payload.contentText,
+      payload.mediaFileId,
+      payload.mediaUniqueId
+    )
     .run();
 }
 
-async function deleteUserSession(env: Env, userId: number): Promise<void> {
-  await env.DB.prepare("DELETE FROM user_sessions WHERE user_id = ?").bind(userId).run();
+async function deletePendingSubmission(env: Env, userId: number): Promise<void> {
+  await env.DB.prepare("DELETE FROM pending_user_submissions WHERE user_id = ?").bind(userId).run();
 }
 
 async function getAdminSession(env: Env, adminId: number): Promise<AdminSessionRow | null> {
@@ -1454,22 +1701,23 @@ async function deleteAdminSession(env: Env, adminId: number): Promise<void> {
 }
 
 async function clearActorSessions(env: Env, actorId: number): Promise<boolean> {
-  const [userResult, adminResult] = await env.DB.batch([
+  const [userResult, adminResult, pendingResult] = await env.DB.batch([
     env.DB.prepare("DELETE FROM user_sessions WHERE user_id = ?").bind(actorId),
-    env.DB.prepare("DELETE FROM admin_sessions WHERE admin_id = ?").bind(actorId)
+    env.DB.prepare("DELETE FROM admin_sessions WHERE admin_id = ?").bind(actorId),
+    env.DB.prepare("DELETE FROM pending_user_submissions WHERE user_id = ?").bind(actorId)
   ]);
 
-  return (userResult.meta.changes ?? 0) > 0 || (adminResult.meta.changes ?? 0) > 0;
+  return (
+    (userResult.meta.changes ?? 0) > 0 ||
+    (adminResult.meta.changes ?? 0) > 0 ||
+    (pendingResult.meta.changes ?? 0) > 0
+  );
 }
 
 async function buildHelpText(env: Env, actorId: number, config: AppConfig): Promise<string> {
   const lines = [
     "用户指令：",
-    "/submit - 开始投稿并选择是否显示投稿人",
-    "/submit_show - 直接以显示投稿人的方式投稿",
-    "/submit_hide - 直接匿名投稿",
-    "/cancel - 取消当前投稿或审核输入",
-    "/whoami - 查看自己的用户 ID 和当前聊天 ID"
+    "/submit - 打开投稿入口"
   ];
 
   if (await actorIsAdmin(env, actorId, config)) {
@@ -1481,7 +1729,11 @@ async function buildHelpText(env: Env, actorId: number, config: AppConfig): Prom
       "/del_reason <ID> - 删除固定驳回理由",
       "/add_blacklist <关键词> - 添加黑名单关键词",
       "/list_blacklist - 查看黑名单关键词",
-      "/del_blacklist <ID> - 删除黑名单关键词"
+      "/del_blacklist <ID> - 删除黑名单关键词",
+      "/set_rate_limit <分钟> - 设置用户投稿间隔",
+      "/rate_limit - 查看当前投稿间隔",
+      "/whoami - 查看自己的用户 ID 和当前聊天 ID",
+      "/cancel - 取消当前审核输入"
     );
   }
 
@@ -1505,20 +1757,14 @@ function buildMiniAppLaunchKeyboard(config: AppConfig): InlineKeyboardMarkup | u
   };
 }
 
-function buildUserSubmissionModeKeyboard(config: AppConfig): InlineKeyboardMarkup {
-  const rows: InlineKeyboardButton[][] = [];
-
-  if (config.miniAppUrl) {
-    rows.push([{ text: "打开投稿小程序", web_app: { url: config.miniAppUrl } }]);
-  }
-
-  rows.push([
-    { text: "显示投稿人", callback_data: `${USER_CALLBACK_MODE}:1` },
-    { text: "匿名投稿", callback_data: `${USER_CALLBACK_MODE}:0` }
-  ]);
-
+function buildDirectSubmissionConfirmKeyboard(sourceMessageId: number): InlineKeyboardMarkup {
   return {
-    inline_keyboard: rows
+    inline_keyboard: [
+      [
+        { text: "确认投稿", callback_data: `${DIRECT_SUBMISSION_CONFIRM}:submit:${sourceMessageId}` },
+        { text: "取消", callback_data: `${DIRECT_SUBMISSION_CONFIRM}:cancel:${sourceMessageId}` }
+      ]
+    ]
   };
 }
 
@@ -1587,6 +1833,36 @@ async function sendMessage(
   });
 }
 
+async function sendPhoto(
+  env: Env,
+  chatId: number | string,
+  photo: string,
+  caption?: string,
+  replyMarkup?: InlineKeyboardMarkup
+): Promise<TelegramMessage> {
+  if (!photo.startsWith("data:image/")) {
+    return telegramApi<TelegramMessage>(env, "sendPhoto", {
+      chat_id: chatId,
+      photo,
+      caption,
+      reply_markup: replyMarkup
+    });
+  }
+
+  const { blob, filename } = dataUrlToBlob(photo);
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("photo", blob, filename);
+  if (caption) {
+    form.append("caption", truncateForTelegram(caption, 1024));
+  }
+  if (replyMarkup) {
+    form.append("reply_markup", JSON.stringify(replyMarkup));
+  }
+
+  return telegramApiFormData<TelegramMessage>(env, "sendPhoto", form);
+}
+
 async function answerCallbackQuery(
   env: Env,
   callbackQueryId: string,
@@ -1611,6 +1887,14 @@ async function editReplyMarkup(
     message_id: messageId,
     reply_markup: replyMarkup
   });
+}
+
+function requireMediaFileId(submission: SubmissionRow): string {
+  if (!submission.media_file_id) {
+    throw new UserVisibleError("这条媒体投稿缺少文件信息，无法发送。");
+  }
+
+  return submission.media_file_id;
 }
 
 async function authenticateMiniAppRequest(
@@ -1699,6 +1983,22 @@ async function telegramApi<T>(
       "content-type": "application/json"
     },
     body: JSON.stringify(payload)
+  });
+
+  const data = (await response.json()) as TelegramApiResponse<T>;
+  if (!response.ok || !data.ok) {
+    const description = data.description ?? `Telegram API error while calling ${method}`;
+    throw new UserVisibleError(description);
+  }
+
+  return data.result;
+}
+
+async function telegramApiFormData<T>(env: Env, method: string, form: FormData): Promise<T> {
+  const secrets = getTelegramSecrets(env);
+  const response = await fetch(`https://api.telegram.org/bot${secrets.TELEGRAM_BOT_TOKEN}/${method}`, {
+    method: "POST",
+    body: form
   });
 
   const data = (await response.json()) as TelegramApiResponse<T>;
@@ -1820,6 +2120,54 @@ function normalizeOptionalText(value: unknown): string | null {
   return text ? text : null;
 }
 
+function normalizeMiniAppImageDataUrl(value: unknown, sizeValue: unknown): string | null {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  if (typeof value !== "string") {
+    throw new ApiError("图片数据无效。");
+  }
+
+  const size = typeof sizeValue === "number" ? sizeValue : estimateDataUrlBytes(value);
+  if (size > MAX_MINI_APP_IMAGE_BYTES) {
+    throw new ApiError("图片不能超过 1MB。");
+  }
+
+  if (!/^data:image\/(jpeg|jpg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(value)) {
+    throw new ApiError("仅支持 JPG、PNG 或 WebP 图片。");
+  }
+
+  return value;
+}
+
+function estimateDataUrlBytes(dataUrl: string): number {
+  const base64 = dataUrl.split(",", 2)[1] ?? "";
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  return Math.floor((base64.length * 3) / 4) - padding;
+}
+
+function dataUrlToBlob(dataUrl: string): { blob: Blob; filename: string } {
+  const match = dataUrl.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,(.+)$/);
+  if (!match) {
+    throw new UserVisibleError("图片数据无效。");
+  }
+
+  const mimeType = match[1] === "image/jpg" ? "image/jpeg" : match[1];
+  const base64 = match[2] ?? "";
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  const extension = mimeType.split("/")[1] === "jpeg" ? "jpg" : mimeType.split("/")[1];
+  return {
+    blob: new Blob([bytes], { type: mimeType }),
+    filename: `submission.${extension}`
+  };
+}
+
 function normalizeSubmissionStatus(value: string | null): SubmissionStatus | "all" {
   const allowedStatuses: Array<SubmissionStatus | "all"> = [
     "pending",
@@ -1841,6 +2189,25 @@ function truncateForTelegram(text: string, limit: number): string {
   }
 
   return `${text.slice(0, Math.max(limit - 1, 0)).trimEnd()}…`;
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds <= 0) {
+    return "不限制";
+  }
+
+  if (seconds < 60) {
+    return `${seconds} 秒`;
+  }
+
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes} 分钟`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+  return restMinutes === 0 ? `${hours} 小时` : `${hours} 小时 ${restMinutes} 分钟`;
 }
 
 function serializeMiniAppUser(user: MiniAppUser): {
@@ -2344,6 +2711,9 @@ function renderMiniAppHtml(): string {
       submissions: [],
       reasons: [],
       blacklist: [],
+      imageDataUrl: null,
+      imageSize: 0,
+      imageName: "",
       flash: null
     };
 
@@ -2400,6 +2770,9 @@ function renderMiniAppHtml(): string {
         state.submissions = payload.submissions || [];
         state.reasons = payload.reasons || [];
         state.blacklist = payload.blacklist || [];
+        if (state.role.isAdmin) {
+          state.tab = "review";
+        }
       } catch (error) {
         state.flash = { type: "err", text: error.message };
       } finally {
@@ -2418,10 +2791,9 @@ function renderMiniAppHtml(): string {
         ? escapeHtml(state.user.username ? "@" + state.user.username : state.user.firstName)
         : "未登录";
       const tabs = state.role.isAdmin
-        ? '<button class="tab ' + (state.tab === "submit" ? "active" : "") + '" data-action="tab" data-tab="submit">投稿</button>' +
-          '<button class="tab ' + (state.tab === "review" ? "active" : "") + '" data-action="tab" data-tab="review">审核</button>' +
+        ? '<button class="tab ' + (state.tab === "review" ? "active" : "") + '" data-action="tab" data-tab="review">审核</button>' +
           '<button class="tab ' + (state.tab === "rules" ? "active" : "") + '" data-action="tab" data-tab="rules">规则</button>'
-        : '<button class="tab active" data-action="tab" data-tab="submit">投稿</button>';
+        : "";
       const roleText = state.role.isAdmin ? "管理员" : "投稿人";
 
       root.innerHTML =
@@ -2429,7 +2801,7 @@ function renderMiniAppHtml(): string {
           '<div class="brand"><h1>投稿审核台</h1><p>' + username + '</p></div>' +
           '<div class="badge">' + roleText + '</div>' +
         '</div>' +
-        '<nav class="tabs">' + tabs + '</nav>' +
+        (tabs ? '<nav class="tabs">' + tabs + '</nav>' : '') +
         renderFlash() +
         renderCurrentTab();
     }
@@ -2448,14 +2820,22 @@ function renderMiniAppHtml(): string {
       if (state.tab === "rules" && state.role.isAdmin) {
         return renderRules();
       }
+      if (state.role.isAdmin) {
+        return renderReview();
+      }
       return renderSubmit();
     }
 
     function renderSubmit() {
+      const imageLabel = state.imageName
+        ? '<div class="message show ok">已选择：' + escapeHtml(state.imageName) + '</div>'
+        : '';
       return '<section class="panel">' +
         '<div class="panel-header"><h2>新投稿</h2></div>' +
         '<div class="panel-body">' +
           '<div class="field"><label for="submitText">正文</label><textarea id="submitText" maxlength="3800" placeholder="输入新闻投稿正文"></textarea></div>' +
+          '<div class="field"><label for="submitImage">配图（可选，小于 1MB）</label><input id="submitImage" type="file" accept="image/png,image/jpeg,image/webp"></div>' +
+          imageLabel +
           '<label class="switch-row"><span>显示投稿人</span><input id="displaySender" type="checkbox"></label>' +
           '<button class="btn primary" data-action="submit" ' + (state.busy ? "disabled" : "") + '>提交审核</button>' +
         '</div>' +
@@ -2497,22 +2877,12 @@ function renderMiniAppHtml(): string {
         return '<div class="empty">选择一条投稿</div>';
       }
 
-      const reasonOptions = ['<option value="">无理由驳回</option>']
-        .concat(state.reasons.map(function (reason) {
-          return '<option value="' + escapeHtml(reason.reason) + '">' + escapeHtml(reason.reason) + '</option>';
-        }))
-        .join("");
-
-      return '<div class="field"><label>原文</label><textarea readonly>' + escapeHtml(item.contentText || "") + '</textarea></div>' +
-        '<div class="field"><label for="editText">修改后文案</label><textarea id="editText" maxlength="3800">' + escapeHtml(item.contentText || "") + '</textarea></div>' +
+      const mediaHint = item.contentType === "photo" ? '<div class="message show ok">这条投稿包含配图，发送时会一并发送到频道。</div>' : '';
+      return mediaHint +
+        '<div class="field"><label for="reviewText">投稿文案</label><textarea id="reviewText" maxlength="3800">' + escapeHtml(item.contentText || "") + '</textarea></div>' +
         '<div class="toolbar">' +
-          '<button class="btn primary" data-action="publish-direct" ' + (state.busy ? "disabled" : "") + '>直接发送</button>' +
-          '<button class="btn primary" data-action="publish-edited" ' + (state.busy ? "disabled" : "") + '>修改后发送</button>' +
-        '</div>' +
-        '<hr style="border:0;border-top:1px solid var(--line);margin:16px 0">' +
-        '<div class="field"><label for="reasonSelect">驳回理由</label><select id="reasonSelect">' + reasonOptions + '</select></div>' +
-        '<div class="field"><label for="manualReason">手动理由</label><input id="manualReason" maxlength="300" placeholder="留空则使用上方选择"></div>' +
-        '<button class="btn danger" data-action="reject" ' + (state.busy ? "disabled" : "") + '>驳回</button>';
+          '<button class="btn primary" data-action="publish-reviewed" ' + (state.busy ? "disabled" : "") + '>发送</button>' +
+        '</div>';
     }
 
     function renderRules() {
@@ -2566,6 +2936,77 @@ function renderMiniAppHtml(): string {
       }
     }
 
+    function resetImageSelection() {
+      state.imageDataUrl = null;
+      state.imageSize = 0;
+      state.imageName = "";
+    }
+
+    function readFileAsDataUrl(file) {
+      return new Promise(function (resolve, reject) {
+        const reader = new FileReader();
+        reader.onload = function () {
+          if (typeof reader.result === "string") {
+            resolve(reader.result);
+            return;
+          }
+          reject(new Error("图片读取失败"));
+        };
+        reader.onerror = function () {
+          reject(new Error("图片读取失败"));
+        };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    root.addEventListener("change", function (event) {
+      if (!event.target || event.target.id !== "submitImage") {
+        return;
+      }
+
+      const file = event.target.files && event.target.files[0] ? event.target.files[0] : null;
+      if (!file) {
+        resetImageSelection();
+        render();
+        return;
+      }
+
+      if (file.size > 1024 * 1024) {
+        resetImageSelection();
+        state.flash = { type: "err", text: "图片不能超过 1MB。" };
+        event.target.value = "";
+        render();
+        return;
+      }
+
+      if (["image/jpeg", "image/png", "image/webp"].indexOf(file.type) === -1) {
+        resetImageSelection();
+        state.flash = { type: "err", text: "仅支持 JPG、PNG 或 WebP 图片。" };
+        event.target.value = "";
+        render();
+        return;
+      }
+
+      state.busy = true;
+      state.flash = null;
+      render();
+      readFileAsDataUrl(file)
+        .then(function (dataUrl) {
+          state.imageDataUrl = dataUrl;
+          state.imageSize = file.size;
+          state.imageName = file.name || "配图";
+          state.flash = { type: "ok", text: "配图已选择。" };
+        })
+        .catch(function (error) {
+          resetImageSelection();
+          state.flash = { type: "err", text: error.message };
+        })
+        .finally(function () {
+          state.busy = false;
+          render();
+        });
+    });
+
     root.addEventListener("click", function (event) {
       const target = event.target.closest("[data-action]");
       if (!target) {
@@ -2601,8 +3042,14 @@ function renderMiniAppHtml(): string {
         withBusy(async function () {
           const payload = await api("/api/submissions", {
             method: "POST",
-            body: JSON.stringify({ text: text, displaySender: displaySender })
+            body: JSON.stringify({
+              text: text,
+              displaySender: displaySender,
+              imageDataUrl: state.imageDataUrl,
+              imageSize: state.imageSize
+            })
           });
+          resetImageSelection();
           state.flash = payload.autoRejected
             ? { type: "err", text: "已自动驳回：" + payload.reason }
             : { type: "ok", text: "已提交审核，编号 #" + payload.submission.id };
@@ -2610,31 +3057,16 @@ function renderMiniAppHtml(): string {
         return;
       }
 
-      if (action === "publish-direct" || action === "publish-edited") {
+      if (action === "publish-reviewed") {
         const submissionId = state.selectedId;
-        const editedText = action === "publish-edited" ? document.getElementById("editText").value : null;
+        const reviewText = document.getElementById("reviewText").value;
         withBusy(async function () {
           await api("/api/submissions/" + submissionId + "/publish", {
             method: "POST",
-            body: JSON.stringify({ editedText: editedText })
+            body: JSON.stringify({ editedText: reviewText })
           });
           await refreshPending();
           state.flash = { type: "ok", text: "已发送到频道" };
-        });
-        return;
-      }
-
-      if (action === "reject") {
-        const submissionId = state.selectedId;
-        const manualReason = document.getElementById("manualReason").value.trim();
-        const selectedReason = document.getElementById("reasonSelect").value;
-        withBusy(async function () {
-          await api("/api/submissions/" + submissionId + "/reject", {
-            method: "POST",
-            body: JSON.stringify({ reason: manualReason || selectedReason || null })
-          });
-          await refreshPending();
-          state.flash = { type: "ok", text: "已驳回" };
         });
         return;
       }

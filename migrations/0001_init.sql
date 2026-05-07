@@ -4,6 +4,13 @@ CREATE TABLE IF NOT EXISTS admins (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_by INTEGER,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS rejection_reasons (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   reason TEXT NOT NULL UNIQUE,
@@ -24,6 +31,17 @@ CREATE TABLE IF NOT EXISTS user_sessions (
   display_sender INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS pending_user_submissions (
+  user_id INTEGER PRIMARY KEY,
+  user_chat_id INTEGER NOT NULL,
+  source_message_id INTEGER NOT NULL,
+  content_type TEXT NOT NULL,
+  content_text TEXT,
+  media_file_id TEXT,
+  media_unique_id TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS admin_sessions (
