@@ -11,15 +11,28 @@ if (!databaseId) {
 
 const configPath = new URL("../wrangler.jsonc", import.meta.url);
 const rawConfig = await readFile(configPath, "utf8");
-const deployConfig = rawConfig.replaceAll("__D1_DATABASE_ID_FROM_CLOUDFLARE_BUILD_VARIABLE__", databaseId);
+const deployConfig = JSON.parse(rawConfig);
 
-if (deployConfig.includes("__D1_DATABASE_ID_FROM_CLOUDFLARE_BUILD_VARIABLE__")) {
+for (const database of deployConfig.d1_databases ?? []) {
+  if (database.binding === "DB") {
+    database.database_id = databaseId;
+  }
+}
+
+if (
+  !deployConfig.d1_databases?.some(
+    (database) => database.binding === "DB" && database.database_id === databaseId
+  )
+) {
   console.error("Failed to inject D1_DATABASE_ID into wrangler.jsonc.");
   process.exit(1);
 }
 
+deployConfig.keep_vars = true;
+delete deployConfig.vars;
+
 const generatedConfig = new URL("../.wrangler.generated.jsonc", import.meta.url);
-await writeFile(generatedConfig, deployConfig);
+await writeFile(generatedConfig, `${JSON.stringify(deployConfig, null, 2)}\n`);
 
 const child = spawn(
   "npx",

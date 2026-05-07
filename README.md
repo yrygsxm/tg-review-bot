@@ -89,6 +89,7 @@ Cloudflare 官方说明：
 安全说明：
 
 - `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_WEBHOOK_SECRET` 必须用 Secret。
+- 不要把 `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_WEBHOOK_SECRET` 配成普通变量；普通变量可能出现在构建日志里。
 - `D1_DATABASE_ID` 不是数据库密码，但公开仓库里不放真实值。
 - GitHub 里的 [wrangler.jsonc](/Users/simon/Documents/tg 投稿审核机器人/wrangler.jsonc) 只保留占位符。
 
@@ -171,6 +172,7 @@ Telegram 官方说明：
 - 确认 Worker 构建变量里存在 `D1_DATABASE_ID`。
 - 确认 Deploy command 是 `npm run deploy`。
 - 确认不是 Pages 项目，而是 Worker / Workers Builds。
+- 如果日志显示 `Executing user deploy command: npx wrangler deploy`，说明 Deploy command 仍然是错的。
 
 `Missing TELEGRAM_BOT_TOKEN secret`
 
