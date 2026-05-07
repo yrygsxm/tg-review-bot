@@ -1,4 +1,8 @@
 node_modules/
 .wrangler/
+.wrangler.generated.jsonc
 .dev.vars
+.dev.vars.*
+.env
+.env.*
 npm-debug.log*

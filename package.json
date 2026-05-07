@@ -6,7 +6,7 @@
   "scripts": {
     "cf-typegen": "wrangler types",
     "check": "npm run cf-typegen && tsc --noEmit",
-    "deploy": "wrangler deploy",
+    "deploy": "node ./scripts/deploy.mjs",
     "dev": "wrangler dev",
     "set-webhook": "node ./scripts/set-webhook.mjs"
   },
