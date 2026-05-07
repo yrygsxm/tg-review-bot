@@ -1,10 +1,18 @@
 # D1 Dashboard 初始化步骤
 
-在 Cloudflare D1 Dashboard 的 SQL 查询页里，按下面顺序分三次执行。
+Cloudflare D1 Dashboard 的 SQL Console 可能只执行“当前光标所在的一条语句”。如果页面显示 `Executed 1/1`，说明它只执行了一条 SQL。
 
-不要只执行光标所在的一行。如果 Dashboard 只显示 `Executed 1/1`，说明它只执行了一条语句。
+因此不要一次粘贴多条后直接点运行。按下面顺序，一次只复制并执行一个代码块。
 
-## 1. 创建数据表
+## 0. 先检查当前状态
+
+```sql
+SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;
+```
+
+如果没有看到 `blacklist_keywords`、`submissions` 等表，继续执行下面的建表语句。
+
+## 1. 创建 admins
 
 ```sql
 CREATE TABLE IF NOT EXISTS admins (
@@ -12,21 +20,33 @@ CREATE TABLE IF NOT EXISTS admins (
   role TEXT NOT NULL DEFAULT 'admin',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+```
 
+## 2. 创建 rejection_reasons
+
+```sql
 CREATE TABLE IF NOT EXISTS rejection_reasons (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   reason TEXT NOT NULL UNIQUE,
   created_by INTEGER NOT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+```
 
+## 3. 创建 blacklist_keywords
+
+```sql
 CREATE TABLE IF NOT EXISTS blacklist_keywords (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   keyword TEXT NOT NULL UNIQUE,
   created_by INTEGER NOT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+```
 
+## 4. 创建 user_sessions
+
+```sql
 CREATE TABLE IF NOT EXISTS user_sessions (
   user_id INTEGER PRIMARY KEY,
   action TEXT NOT NULL,
@@ -34,7 +54,11 @@ CREATE TABLE IF NOT EXISTS user_sessions (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+```
 
+## 5. 创建 admin_sessions
+
+```sql
 CREATE TABLE IF NOT EXISTS admin_sessions (
   admin_id INTEGER PRIMARY KEY,
   chat_id INTEGER NOT NULL,
@@ -44,7 +68,11 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+```
 
+## 6. 创建 submissions
+
+```sql
 CREATE TABLE IF NOT EXISTS submissions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
@@ -69,15 +97,7 @@ CREATE TABLE IF NOT EXISTS submissions (
 );
 ```
 
-## 2. 创建索引
-
-```sql
-CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(status);
-CREATE INDEX IF NOT EXISTS idx_submissions_review_message ON submissions(review_chat_id, review_message_id);
-CREATE INDEX IF NOT EXISTS idx_blacklist_keyword ON blacklist_keywords(keyword);
-```
-
-## 3. 检查结果
+## 7. 再检查表是否创建成功
 
 ```sql
 SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;
@@ -91,3 +111,25 @@ SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;
 - `rejection_reasons`
 - `submissions`
 - `user_sessions`
+
+## 8. 创建索引
+
+表确认存在后，再一条一条执行索引。
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(status);
+```
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_submissions_review_message ON submissions(review_chat_id, review_message_id);
+```
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_blacklist_keyword ON blacklist_keywords(keyword);
+```
+
+## 9. 检查索引
+
+```sql
+SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name;
+```
