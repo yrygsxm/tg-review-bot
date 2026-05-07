@@ -193,6 +193,14 @@ interface MiniAppModerationInput {
   reason?: unknown;
 }
 
+interface MiniAppRateLimitInput {
+  minutes?: unknown;
+}
+
+interface MiniAppAdminInput {
+  userId?: unknown;
+}
+
 class UserVisibleError extends Error {}
 class ApiError extends Error {
   constructor(message: string, readonly status = 400) {
@@ -281,7 +289,11 @@ async function handleMiniAppApi(request: Request, env: Env, url: URL): Promise<R
         },
         submissions: auth.isAdmin ? await listSubmissions(env, "pending") : [],
         reasons: auth.isAdmin ? await listRejectionReasons(env) : [],
-        blacklist: auth.isAdmin ? await listBlacklistKeywords(env) : []
+        blacklist: auth.isAdmin ? await listBlacklistKeywords(env) : [],
+        admins: auth.isAdmin ? await listAdmins(env) : [],
+        settings: auth.isAdmin
+          ? serializeRateLimitSetting(await getSubmissionIntervalSeconds(env))
+          : null
       });
     }
 
@@ -361,6 +373,33 @@ async function handleMiniAppApi(request: Request, env: Env, url: URL): Promise<R
         .bind(Number.parseInt(blacklistDeleteMatch[1] ?? "", 10))
         .run();
       return jsonResponse({ blacklist: await listBlacklistKeywords(env) });
+    }
+
+    if (request.method === "POST" && path === "/api/settings/rate-limit") {
+      const input = (await readJsonBody(request)) as MiniAppRateLimitInput;
+      const minutes = normalizeNonNegativeNumber(input.minutes, "投稿间隔必须是大于或等于 0 的数字。");
+      const seconds = Math.round(minutes * 60);
+      await setSubmissionIntervalSeconds(env, seconds, auth.user.id);
+      return jsonResponse({ settings: serializeRateLimitSetting(seconds) });
+    }
+
+    if (request.method === "POST" && path === "/api/admins") {
+      requireMiniAppSuperadmin(auth);
+      const input = (await readJsonBody(request)) as MiniAppAdminInput;
+      const userId = normalizeTelegramUserId(input.userId, "请填写管理员用户 ID。");
+      await addAdmin(env, userId);
+      return jsonResponse({ admins: await listAdmins(env) }, 201);
+    }
+
+    const adminDeleteMatch = path.match(/^\/api\/admins\/(\d+)$/);
+    if (request.method === "DELETE" && adminDeleteMatch) {
+      requireMiniAppSuperadmin(auth);
+      const userId = Number.parseInt(adminDeleteMatch[1] ?? "", 10);
+      if (!Number.isSafeInteger(userId) || userId <= 0) {
+        throw new ApiError("管理员用户 ID 无效。");
+      }
+      await deleteAdmin(env, userId);
+      return jsonResponse({ admins: await listAdmins(env) });
     }
 
     return jsonResponse({ ok: false, error: "Not Found" }, 404);
@@ -554,8 +593,8 @@ async function handleCommand(
     }
     case "set_rate_limit": {
       requireArgument(args, "请提供投稿间隔分钟数，例如：/set_rate_limit 60");
-      const minutes = Number.parseFloat(args);
-      if (!Number.isFinite(minutes) || minutes < 0) {
+      const minutes = /^\d+(?:\.\d+)?$/.test(args) ? Number.parseFloat(args) : NaN;
+      if (!Number.isFinite(minutes)) {
         throw new UserVisibleError("投稿间隔必须是大于或等于 0 的数字，单位是分钟。");
       }
       const seconds = Math.round(minutes * 60);
@@ -573,13 +612,11 @@ async function handleCommand(
         throw new UserVisibleError("只有超级管理员可以添加管理员。");
       }
       requireArgument(args, "请提供管理员用户 ID，例如：/add_admin 123456789");
-      const userId = Number.parseInt(args, 10);
-      if (Number.isNaN(userId)) {
+      const userId = /^\d+$/.test(args) ? Number.parseInt(args, 10) : NaN;
+      if (!Number.isSafeInteger(userId) || userId <= 0) {
         throw new UserVisibleError("管理员用户 ID 必须是数字。");
       }
-      await env.DB.prepare("INSERT OR REPLACE INTO admins (user_id, role) VALUES (?, 'admin')")
-        .bind(userId)
-        .run();
+      await addAdmin(env, userId);
       await sendMessage(env, message.chat.id, `已添加管理员：${userId}`);
       return;
     }
@@ -588,13 +625,11 @@ async function handleCommand(
         throw new UserVisibleError("只有超级管理员可以删除管理员。");
       }
       requireArgument(args, "请提供管理员用户 ID，例如：/del_admin 123456789");
-      const userId = Number.parseInt(args, 10);
-      if (Number.isNaN(userId)) {
+      const userId = /^\d+$/.test(args) ? Number.parseInt(args, 10) : NaN;
+      if (!Number.isSafeInteger(userId) || userId <= 0) {
         throw new UserVisibleError("管理员用户 ID 必须是数字。");
       }
-      await env.DB.prepare("DELETE FROM admins WHERE user_id = ? AND role <> 'superadmin'")
-        .bind(userId)
-        .run();
+      await deleteAdmin(env, userId);
       await sendMessage(env, message.chat.id, `已删除管理员：${userId}`);
       return;
     }
@@ -1525,6 +1560,32 @@ async function listRejectionReasons(env: Env): Promise<RejectionReasonRow[]> {
   return result.results ?? [];
 }
 
+async function listAdmins(env: Env): Promise<Array<ReturnType<typeof serializeAdmin>>> {
+  const result = await env.DB.prepare("SELECT user_id, role FROM admins ORDER BY role DESC, user_id ASC")
+    .run<AdminRow>();
+  return (result.results ?? []).map(serializeAdmin);
+}
+
+async function addAdmin(env: Env, userId: number): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO admins (user_id, role)
+     VALUES (?, 'admin')
+     ON CONFLICT(user_id) DO UPDATE SET
+       role = CASE
+         WHEN admins.role = 'superadmin' THEN admins.role
+         ELSE 'admin'
+       END`
+  )
+    .bind(userId)
+    .run();
+}
+
+async function deleteAdmin(env: Env, userId: number): Promise<void> {
+  await env.DB.prepare("DELETE FROM admins WHERE user_id = ? AND role <> 'superadmin'")
+    .bind(userId)
+    .run();
+}
+
 async function listBlacklistKeywords(env: Env): Promise<BlacklistKeywordRow[]> {
   const result = await env.DB.prepare("SELECT id, keyword FROM blacklist_keywords ORDER BY id ASC")
     .run<BlacklistKeywordRow>();
@@ -2120,6 +2181,32 @@ function normalizeOptionalText(value: unknown): string | null {
   return text ? text : null;
 }
 
+function normalizeNonNegativeNumber(value: unknown, errorMessage: string): number {
+  const normalizedValue = typeof value === "number"
+    ? value
+    : typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value.trim())
+      ? Number.parseFloat(value)
+      : NaN;
+  if (!Number.isFinite(normalizedValue) || normalizedValue < 0) {
+    throw new ApiError(errorMessage);
+  }
+
+  return normalizedValue;
+}
+
+function normalizeTelegramUserId(value: unknown, errorMessage: string): number {
+  const normalizedValue = typeof value === "number"
+    ? value
+    : typeof value === "string" && /^\d+$/.test(value.trim())
+      ? Number.parseInt(value, 10)
+      : NaN;
+  if (!Number.isSafeInteger(normalizedValue) || normalizedValue <= 0) {
+    throw new ApiError(errorMessage);
+  }
+
+  return normalizedValue;
+}
+
 function normalizeMiniAppImageDataUrl(value: unknown, sizeValue: unknown): string | null {
   if (value === null || value === undefined || value === "") {
     return null;
@@ -2226,9 +2313,39 @@ function serializeMiniAppUser(user: MiniAppUser): {
   };
 }
 
+function serializeAdmin(admin: AdminRow): {
+  userId: number;
+  role: string;
+  isSuperadmin: boolean;
+} {
+  return {
+    userId: admin.user_id,
+    role: admin.role,
+    isSuperadmin: admin.role === "superadmin"
+  };
+}
+
+function serializeRateLimitSetting(seconds: number): {
+  submissionIntervalSeconds: number;
+  submissionIntervalMinutes: number;
+  submissionIntervalText: string;
+} {
+  return {
+    submissionIntervalSeconds: seconds,
+    submissionIntervalMinutes: seconds / 60,
+    submissionIntervalText: formatDuration(seconds)
+  };
+}
+
 function requireMiniAppAdmin(auth: MiniAppAuth): void {
   if (!auth.isAdmin) {
     throw new ApiError("你没有审核权限。", 403);
+  }
+}
+
+function requireMiniAppSuperadmin(auth: MiniAppAuth): void {
+  if (!auth.isSuperadmin) {
+    throw new ApiError("只有超级管理员可以管理管理员。", 403);
   }
 }
 
@@ -2711,6 +2828,8 @@ function renderMiniAppHtml(): string {
       submissions: [],
       reasons: [],
       blacklist: [],
+      admins: [],
+      settings: { submissionIntervalSeconds: 3600, submissionIntervalMinutes: 60, submissionIntervalText: "1 小时" },
       imageDataUrl: null,
       imageSize: 0,
       imageName: "",
@@ -2770,6 +2889,8 @@ function renderMiniAppHtml(): string {
         state.submissions = payload.submissions || [];
         state.reasons = payload.reasons || [];
         state.blacklist = payload.blacklist || [];
+        state.admins = payload.admins || [];
+        state.settings = payload.settings || state.settings;
         if (state.role.isAdmin) {
           state.tab = "review";
         }
@@ -2886,6 +3007,9 @@ function renderMiniAppHtml(): string {
     }
 
     function renderRules() {
+      const adminPanel = state.role.isSuperadmin
+        ? '<div class="item-row"><input id="newAdminId" inputmode="numeric" placeholder="新增管理员用户 ID"><button class="btn primary" data-action="add-admin">添加</button></div>'
+        : '<div class="message show ok">只有超级管理员可以新增或删除管理员。</div>';
       return '<section class="grid">' +
         '<div class="panel">' +
           '<div class="panel-header"><h2>驳回理由</h2></div>' +
@@ -2901,6 +3025,20 @@ function renderMiniAppHtml(): string {
             '<div class="rule-list">' + renderRuleList(state.blacklist, "delete-keyword") + '</div>' +
           '</div>' +
         '</div>' +
+        '<div class="panel">' +
+          '<div class="panel-header"><h2>投稿频率</h2></div>' +
+          '<div class="panel-body">' +
+            '<div class="field"><label for="rateLimitMinutes">同一用户投稿间隔（分钟，0 表示不限制）</label><input id="rateLimitMinutes" type="number" min="0" step="0.5" value="' + escapeHtml(state.settings.submissionIntervalMinutes) + '"></div>' +
+            '<div class="toolbar"><button class="btn primary" data-action="set-rate-limit">保存</button><span class="status">' + escapeHtml(state.settings.submissionIntervalText) + '</span></div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="panel">' +
+          '<div class="panel-header"><h2>管理员</h2></div>' +
+          '<div class="panel-body">' +
+            adminPanel +
+            '<div class="rule-list">' + renderAdminList() + '</div>' +
+          '</div>' +
+        '</div>' +
       '</section>';
     }
 
@@ -2911,6 +3049,20 @@ function renderMiniAppHtml(): string {
       return items.map(function (item) {
         const text = item.reason || item.keyword;
         return '<div class="rule-item"><span>' + escapeHtml(text) + '</span><button class="btn ghost" data-action="' + action + '" data-id="' + item.id + '">删除</button></div>';
+      }).join("");
+    }
+
+    function renderAdminList() {
+      if (!state.admins.length) {
+        return '<div class="empty">暂无管理员</div>';
+      }
+
+      return state.admins.map(function (admin) {
+        const label = admin.isSuperadmin ? "超级管理员" : "管理员";
+        const deleteButton = state.role.isSuperadmin && !admin.isSuperadmin
+          ? '<button class="btn ghost" data-action="delete-admin" data-id="' + admin.userId + '">删除</button>'
+          : '';
+        return '<div class="rule-item"><span>' + admin.userId + ' · ' + label + '</span>' + deleteButton + '</div>';
       }).join("");
     }
 
@@ -3111,6 +3263,41 @@ function renderMiniAppHtml(): string {
           const payload = await api("/api/blacklist/" + target.dataset.id, { method: "DELETE" });
           state.blacklist = payload.blacklist || [];
           state.flash = { type: "ok", text: "已删除关键词" };
+        });
+        return;
+      }
+
+      if (action === "set-rate-limit") {
+        const minutes = document.getElementById("rateLimitMinutes").value;
+        withBusy(async function () {
+          const payload = await api("/api/settings/rate-limit", {
+            method: "POST",
+            body: JSON.stringify({ minutes: minutes })
+          });
+          state.settings = payload.settings || state.settings;
+          state.flash = { type: "ok", text: "已保存投稿频率设置" };
+        });
+        return;
+      }
+
+      if (action === "add-admin") {
+        const userId = document.getElementById("newAdminId").value;
+        withBusy(async function () {
+          const payload = await api("/api/admins", {
+            method: "POST",
+            body: JSON.stringify({ userId: userId })
+          });
+          state.admins = payload.admins || [];
+          state.flash = { type: "ok", text: "已添加管理员" };
+        });
+        return;
+      }
+
+      if (action === "delete-admin") {
+        withBusy(async function () {
+          const payload = await api("/api/admins/" + target.dataset.id, { method: "DELETE" });
+          state.admins = payload.admins || [];
+          state.flash = { type: "ok", text: "已删除管理员" };
         });
       }
     });
