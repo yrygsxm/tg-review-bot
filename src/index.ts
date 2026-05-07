@@ -352,6 +352,10 @@ async function handleMiniAppApi(request: Request, env: Env, url: URL): Promise<R
       return jsonResponse({ ok: false, error: error.message }, error.status);
     }
 
+    if (error instanceof UserVisibleError) {
+      return jsonResponse({ ok: false, error: error.message }, 400);
+    }
+
     console.error(
       JSON.stringify({
         level: "error",
