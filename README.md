@@ -48,7 +48,8 @@
 3. 创建 D1 数据库，名称建议使用 `tg-review-bot`。
 4. 复制数据库的 `Database ID`。
 5. 打开 D1 数据库的查询页面。
-6. 打开 [migrations/0001_init.sql](/Users/simon/Documents/tg 投稿审核机器人/migrations/0001_init.sql)，把里面的 SQL 放进查询页面执行。
+6. 按 [migrations/dashboard_init.md](/Users/simon/Documents/tg 投稿审核机器人/migrations/dashboard_init.md) 的顺序执行初始化 SQL。
+7. 如果 Dashboard 只显示 `Executed 1/1`，说明它只执行了当前一条语句；需要先执行创建表的 SQL，再执行索引 SQL。
 
 注意：`Database ID` 不写进 GitHub。部署时通过 Cloudflare 构建变量 `D1_DATABASE_ID` 注入。
 
