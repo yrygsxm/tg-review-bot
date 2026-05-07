@@ -7,6 +7,9 @@
   "observability": {
     "enabled": true
   },
+  "triggers": {
+    "crons": ["0 3 * * *"]
+  },
   "vars": {
     "REVIEW_CHAT_ID": "123456789",
     "TARGET_CHANNEL_ID": "@your_channel",

@@ -25,6 +25,16 @@ CREATE TABLE IF NOT EXISTS blacklist_keywords (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS blacklist_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  match_type TEXT NOT NULL,
+  value TEXT NOT NULL,
+  normalized_value TEXT NOT NULL,
+  created_by INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(match_type, normalized_value)
+);
+
 CREATE TABLE IF NOT EXISTS user_sessions (
   user_id INTEGER PRIMARY KEY,
   action TEXT NOT NULL,
@@ -80,3 +90,4 @@ CREATE TABLE IF NOT EXISTS submissions (
 CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(status);
 CREATE INDEX IF NOT EXISTS idx_submissions_review_message ON submissions(review_chat_id, review_message_id);
 CREATE INDEX IF NOT EXISTS idx_blacklist_keyword ON blacklist_keywords(keyword);
+CREATE INDEX IF NOT EXISTS idx_blacklist_users_match ON blacklist_users(match_type, normalized_value);

@@ -38,6 +38,15 @@ interface BlacklistKeywordRow {
   keyword: string;
 }
 
+type UserBlacklistMatchType = "user_id" | "username" | "full_name";
+
+interface UserBlacklistRow {
+  id: number;
+  match_type: UserBlacklistMatchType;
+  value: string;
+  normalized_value: string;
+}
+
 interface UserSessionRow {
   user_id: number;
   action: UserSessionAction;
@@ -150,6 +159,13 @@ interface TelegramDocument {
   file_name?: string;
 }
 
+interface TelegramFile {
+  file_id: string;
+  file_unique_id: string;
+  file_path?: string;
+  file_size?: number;
+}
+
 interface TelegramMessage {
   message_id: number;
   from?: TelegramUser;
@@ -201,6 +217,11 @@ interface MiniAppAdminInput {
   userId?: unknown;
 }
 
+interface MiniAppUserBlacklistInput {
+  matchType?: unknown;
+  value?: unknown;
+}
+
 class UserVisibleError extends Error {}
 class ApiError extends Error {
   constructor(message: string, readonly status = 400) {
@@ -216,6 +237,7 @@ const DIRECT_SUBMISSION_CONFIRM = "u:direct";
 const MINI_APP_AUTH_MAX_AGE_SECONDS = 24 * 60 * 60;
 const DEFAULT_SUBMISSION_INTERVAL_SECONDS = 60 * 60;
 const MAX_MINI_APP_IMAGE_BYTES = 1024 * 1024;
+const SUBMISSION_MEDIA_RETENTION_DAYS = 7;
 
 export default {
   async fetch(request, env): Promise<Response> {
@@ -265,6 +287,10 @@ export default {
     }
 
     return new Response("Not Found", { status: 404 });
+  },
+
+  async scheduled(_controller, env, ctx): Promise<void> {
+    ctx.waitUntil(cleanupExpiredSubmissionMedia(env));
   }
 } satisfies ExportedHandler<Env>;
 
@@ -290,6 +316,7 @@ async function handleMiniAppApi(request: Request, env: Env, url: URL): Promise<R
         submissions: auth.isAdmin ? await listSubmissions(env, "pending") : [],
         reasons: auth.isAdmin ? await listRejectionReasons(env) : [],
         blacklist: auth.isAdmin ? await listBlacklistKeywords(env) : [],
+        userBlacklist: auth.isAdmin ? await listUserBlacklist(env) : [],
         admins: auth.isAdmin ? await listAdmins(env) : [],
         settings: auth.isAdmin
           ? serializeRateLimitSetting(await getSubmissionIntervalSeconds(env))
@@ -307,9 +334,25 @@ async function handleMiniAppApi(request: Request, env: Env, url: URL): Promise<R
 
     if (request.method === "GET" && path === "/api/submissions") {
       const status = normalizeSubmissionStatus(url.searchParams.get("status"));
+      const limit = normalizeListLimit(url.searchParams.get("limit"));
       return jsonResponse({
-        submissions: await listSubmissions(env, status)
+        submissions: await listSubmissions(env, status, limit)
       });
+    }
+
+    const mediaMatch = path.match(/^\/api\/submissions\/(\d+)\/media$/);
+    if (request.method === "GET" && mediaMatch) {
+      const submissionId = Number.parseInt(mediaMatch[1] ?? "", 10);
+      if (Number.isNaN(submissionId)) {
+        throw new ApiError("投稿编号无效。");
+      }
+
+      const submission = await getSubmission(env, submissionId);
+      if (!submission) {
+        throw new ApiError("找不到这条投稿。", 404);
+      }
+
+      return proxySubmissionMedia(env, submission);
     }
 
     const moderationMatch = path.match(/^\/api\/submissions\/(\d+)\/(publish|reject)$/);
@@ -375,6 +418,21 @@ async function handleMiniAppApi(request: Request, env: Env, url: URL): Promise<R
       return jsonResponse({ blacklist: await listBlacklistKeywords(env) });
     }
 
+    if (request.method === "POST" && path === "/api/user-blacklist") {
+      const input = (await readJsonBody(request)) as MiniAppUserBlacklistInput;
+      const rule = normalizeUserBlacklistRule(input.matchType, input.value);
+      await addUserBlacklist(env, rule.matchType, rule.value, rule.normalizedValue, auth.user.id);
+      return jsonResponse({ userBlacklist: await listUserBlacklist(env) }, 201);
+    }
+
+    const userBlacklistDeleteMatch = path.match(/^\/api\/user-blacklist\/(\d+)$/);
+    if (request.method === "DELETE" && userBlacklistDeleteMatch) {
+      await env.DB.prepare("DELETE FROM blacklist_users WHERE id = ?")
+        .bind(Number.parseInt(userBlacklistDeleteMatch[1] ?? "", 10))
+        .run();
+      return jsonResponse({ userBlacklist: await listUserBlacklist(env) });
+    }
+
     if (request.method === "POST" && path === "/api/settings/rate-limit") {
       const input = (await readJsonBody(request)) as MiniAppRateLimitInput;
       const minutes = normalizeNonNegativeNumber(input.minutes, "投稿间隔必须是大于或等于 0 的数字。");
@@ -437,7 +495,16 @@ async function handleUpdate(update: TelegramUpdate, env: Env, config: AppConfig)
 async function handleMessage(message: TelegramMessage, env: Env, config: AppConfig): Promise<void> {
   const command = parseCommand(message.text);
   if (command) {
-    await handleCommand(message, command.name, command.args, env, config);
+    try {
+      await handleCommand(message, command.name, command.args, env, config);
+    } catch (error) {
+      if (error instanceof UserVisibleError) {
+        await sendMessage(env, message.chat.id, error.message);
+        return;
+      }
+
+      throw error;
+    }
     return;
   }
 
@@ -553,8 +620,8 @@ async function handleCommand(
     }
     case "del_reason": {
       requireArgument(args, "请提供要删除的理由 ID，例如：/del_reason 2");
-      const reasonId = Number.parseInt(args, 10);
-      if (Number.isNaN(reasonId)) {
+      const reasonId = /^\d+$/.test(args) ? Number.parseInt(args, 10) : NaN;
+      if (!Number.isSafeInteger(reasonId) || reasonId <= 0) {
         throw new UserVisibleError("理由 ID 必须是数字。");
       }
       await env.DB.prepare("DELETE FROM rejection_reasons WHERE id = ?").bind(reasonId).run();
@@ -583,12 +650,38 @@ async function handleCommand(
     }
     case "del_blacklist": {
       requireArgument(args, "请提供要删除的关键词 ID，例如：/del_blacklist 3");
-      const keywordId = Number.parseInt(args, 10);
-      if (Number.isNaN(keywordId)) {
+      const keywordId = /^\d+$/.test(args) ? Number.parseInt(args, 10) : NaN;
+      if (!Number.isSafeInteger(keywordId) || keywordId <= 0) {
         throw new UserVisibleError("关键词 ID 必须是数字。");
       }
       await env.DB.prepare("DELETE FROM blacklist_keywords WHERE id = ?").bind(keywordId).run();
       await sendMessage(env, message.chat.id, `已删除黑名单关键词 #${keywordId}`);
+      return;
+    }
+    case "add_user_blacklist": {
+      requireArgument(args, "请提供用户黑名单，例如：/add_user_blacklist 123456789 或 /add_user_blacklist @username 或 /add_user_blacklist 昵称");
+      const rule = normalizeUserBlacklistCommand(args);
+      await addUserBlacklist(env, rule.matchType, rule.value, rule.normalizedValue, actor.id);
+      await sendMessage(env, message.chat.id, `已加入用户黑名单：${formatUserBlacklistRule(rule.matchType, rule.value)}`);
+      return;
+    }
+    case "list_user_blacklist": {
+      const users = await listUserBlacklist(env);
+      const text =
+        users.length === 0
+          ? "当前用户黑名单为空。"
+          : ["用户黑名单：", ...users.map((item) => `${item.id}. ${formatUserBlacklistRule(item.matchType, item.value)}`)].join("\n");
+      await sendMessage(env, message.chat.id, text);
+      return;
+    }
+    case "del_user_blacklist": {
+      requireArgument(args, "请提供要删除的用户黑名单 ID，例如：/del_user_blacklist 3");
+      const ruleId = /^\d+$/.test(args) ? Number.parseInt(args, 10) : NaN;
+      if (!Number.isSafeInteger(ruleId) || ruleId <= 0) {
+        throw new UserVisibleError("用户黑名单 ID 必须是数字。");
+      }
+      await env.DB.prepare("DELETE FROM blacklist_users WHERE id = ?").bind(ruleId).run();
+      await sendMessage(env, message.chat.id, `已删除用户黑名单 #${ruleId}`);
       return;
     }
     case "set_rate_limit": {
@@ -1051,7 +1144,9 @@ async function submitPayloadToReview(
   config: AppConfig
 ): Promise<number> {
   const contentText = payload.contentText;
-  const blacklistMatch = await findBlacklistMatch(env, contentText);
+  const userBlacklistMatch = await findUserBlacklistMatch(env, user);
+  const contentBlacklistMatch = userBlacklistMatch ? null : await findBlacklistMatch(env, contentText);
+  const blacklistMatch = userBlacklistMatch ?? contentBlacklistMatch;
 
   if (blacklistMatch) {
     const submissionId = await createSubmission(
@@ -1064,14 +1159,30 @@ async function submitPayloadToReview(
       blacklistMatch
     );
     await safelyRun("notify auto rejection", () =>
-      sendMessage(env, message.chat.id, "你的投稿命中了黑名单关键词，已被系统自动驳回。").then(() => undefined)
+      sendMessage(
+        env,
+        message.chat.id,
+        userBlacklistMatch
+          ? "你的账号在投稿黑名单中，本次投稿已被系统自动驳回。"
+          : "你的投稿命中了黑名单关键词，已被系统自动驳回。"
+      ).then(() => undefined)
     );
     return submissionId;
   }
 
   const submissionId = await createSubmission(env, user, message, displaySender, payload, "pending", null);
   const submission = await mustGetSubmission(env, submissionId);
-  const reviewMessage = await sendSubmissionToReviewChat(env, submission, config.reviewChatId);
+  let reviewMessage: TelegramMessage;
+  try {
+    reviewMessage = await sendSubmissionToReviewChat(env, submission, config.reviewChatId);
+  } catch (error) {
+    if (payload.mediaFileId?.startsWith("data:image/")) {
+      await env.DB.prepare("DELETE FROM submissions WHERE id = ? AND review_message_id IS NULL")
+        .bind(submission.id)
+        .run();
+    }
+    throw error;
+  }
   const mediaRef = extractMediaRefFromMessage(reviewMessage, submission.content_type);
 
   await env.DB.prepare(
@@ -1189,6 +1300,9 @@ async function publishToChannel(
     case "text":
       return sendMessage(env, targetChannelId, text);
     case "photo":
+      if (!submission.media_file_id) {
+        return sendMessage(env, targetChannelId, text || "（原投稿配图已清理）");
+      }
       return sendPhoto(env, targetChannelId, requireMediaFileId(submission), text || undefined);
     case "video":
       return telegramApi<TelegramMessage>(env, "sendVideo", {
@@ -1405,7 +1519,7 @@ async function createSubmission(
   status: SubmissionStatus,
   rejectionReason: string | null
 ): Promise<number> {
-  const fullName = [user.first_name, user.last_name].filter(Boolean).join(" ").trim() || "未命名用户";
+  const fullName = getTelegramFullName(user);
   const result = await env.DB.prepare(
     `INSERT INTO submissions (
       user_id,
@@ -1439,6 +1553,10 @@ async function createSubmission(
     .run();
 
   return Number(result.meta.last_row_id);
+}
+
+function getTelegramFullName(user: TelegramUser): string {
+  return [user.first_name, user.last_name].filter(Boolean).join(" ").trim() || "未命名用户";
 }
 
 async function getSubmission(env: Env, submissionId: number): Promise<SubmissionRow | null> {
@@ -1483,6 +1601,7 @@ async function listSubmissions(
 function serializeSubmission(submission: SubmissionRow): {
   id: number;
   status: SubmissionStatus;
+  userId: number;
   contentType: SubmissionContentType;
   contentText: string;
   author: string;
@@ -1490,12 +1609,15 @@ function serializeSubmission(submission: SubmissionRow): {
   displaySender: boolean;
   rejectionReason: string | null;
   editedText: string | null;
+  hasMedia: boolean;
+  mediaCleared: boolean;
   createdAt: string;
   updatedAt: string;
 } {
   return {
     id: submission.id,
     status: submission.status,
+    userId: submission.user_id,
     contentType: submission.content_type,
     contentText: submission.content_text ?? "",
     author: submission.full_name,
@@ -1503,6 +1625,8 @@ function serializeSubmission(submission: SubmissionRow): {
     displaySender: submission.display_sender === 1,
     rejectionReason: submission.rejection_reason,
     editedText: submission.edited_text,
+    hasMedia: Boolean(submission.media_file_id),
+    mediaCleared: submission.content_type === "photo" && !submission.media_file_id,
     createdAt: submission.created_at,
     updatedAt: submission.updated_at
   };
@@ -1550,6 +1674,20 @@ async function ensureRuntimeTables(env: Env): Promise<void> {
         media_unique_id TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )`
+    ),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS blacklist_users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        match_type TEXT NOT NULL,
+        value TEXT NOT NULL,
+        normalized_value TEXT NOT NULL,
+        created_by INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(match_type, normalized_value)
+      )`
+    ),
+    env.DB.prepare(
+      "CREATE INDEX IF NOT EXISTS idx_blacklist_users_match ON blacklist_users(match_type, normalized_value)"
     )
   ]);
 }
@@ -1592,6 +1730,29 @@ async function listBlacklistKeywords(env: Env): Promise<BlacklistKeywordRow[]> {
   return result.results ?? [];
 }
 
+async function listUserBlacklist(env: Env): Promise<Array<ReturnType<typeof serializeUserBlacklistRule>>> {
+  const result = await env.DB.prepare(
+    "SELECT id, match_type, value, normalized_value FROM blacklist_users ORDER BY id ASC"
+  )
+    .run<UserBlacklistRow>();
+  return (result.results ?? []).map(serializeUserBlacklistRule);
+}
+
+async function addUserBlacklist(
+  env: Env,
+  matchType: UserBlacklistMatchType,
+  value: string,
+  normalizedValue: string,
+  adminId: number
+): Promise<void> {
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO blacklist_users (match_type, value, normalized_value, created_by)
+     VALUES (?, ?, ?, ?)`
+  )
+    .bind(matchType, value, normalizedValue, adminId)
+    .run();
+}
+
 async function findBlacklistMatch(env: Env, text: string | null): Promise<string | null> {
   if (!text) {
     return null;
@@ -1607,6 +1768,46 @@ async function findBlacklistMatch(env: Env, text: string | null): Promise<string
   }
 
   return null;
+}
+
+async function findUserBlacklistMatch(env: Env, user: TelegramUser): Promise<string | null> {
+  const fullName = getTelegramFullName(user);
+  const normalizedUsername = user.username ? normalizeUsername(user.username) : "";
+  const normalizedFullName = normalizeForMatch(fullName);
+  const result = await env.DB.prepare(
+    `SELECT id, match_type, value, normalized_value
+     FROM blacklist_users
+     WHERE (match_type = 'user_id' AND normalized_value = ?)
+        OR (match_type = 'username' AND normalized_value = ?)
+        OR (match_type = 'full_name' AND normalized_value = ?)
+     ORDER BY id ASC
+     LIMIT 1`
+  )
+    .bind(String(user.id), normalizedUsername, normalizedFullName)
+    .first<UserBlacklistRow>();
+
+  return result ? `用户黑名单：${formatUserBlacklistRule(result.match_type, result.value)}` : null;
+}
+
+async function cleanupExpiredSubmissionMedia(env: Env): Promise<void> {
+  const result = await env.DB.prepare(
+    `UPDATE submissions
+     SET media_file_id = NULL,
+         media_unique_id = NULL,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE content_type = 'photo'
+       AND media_file_id IS NOT NULL
+       AND datetime(created_at) <= datetime('now', '-${SUBMISSION_MEDIA_RETENTION_DAYS} days')`
+  )
+    .run();
+
+  console.log(
+    JSON.stringify({
+      level: "info",
+      message: "expired submission media cleanup completed",
+      changes: result.meta.changes ?? 0
+    })
+  );
 }
 
 async function getSubmissionIntervalSeconds(env: Env): Promise<number> {
@@ -1791,6 +1992,9 @@ async function buildHelpText(env: Env, actorId: number, config: AppConfig): Prom
       "/add_blacklist <关键词> - 添加黑名单关键词",
       "/list_blacklist - 查看黑名单关键词",
       "/del_blacklist <ID> - 删除黑名单关键词",
+      "/add_user_blacklist <用户ID|@用户名|昵称> - 精准拉黑用户",
+      "/list_user_blacklist - 查看用户黑名单",
+      "/del_user_blacklist <ID> - 删除用户黑名单",
       "/set_rate_limit <分钟> - 设置用户投稿间隔",
       "/rate_limit - 查看当前投稿间隔",
       "/whoami - 查看自己的用户 ID 和当前聊天 ID",
@@ -2071,6 +2275,37 @@ async function telegramApiFormData<T>(env: Env, method: string, form: FormData):
   return data.result;
 }
 
+async function proxySubmissionMedia(env: Env, submission: SubmissionRow): Promise<Response> {
+  if (submission.content_type !== "photo") {
+    throw new ApiError("这条投稿没有可预览图片。", 404);
+  }
+
+  if (!submission.media_file_id) {
+    throw new ApiError("这条投稿的图片已清理。", 410);
+  }
+
+  const file = await telegramApi<TelegramFile>(env, "getFile", {
+    file_id: submission.media_file_id
+  });
+  if (!file.file_path) {
+    throw new ApiError("无法获取图片文件。", 502);
+  }
+
+  const secrets = getTelegramSecrets(env);
+  const fileResponse = await fetch(`https://api.telegram.org/file/bot${secrets.TELEGRAM_BOT_TOKEN}/${file.file_path}`);
+  if (!fileResponse.ok) {
+    throw new ApiError("图片读取失败。", 502);
+  }
+
+  return new Response(fileResponse.body, {
+    status: 200,
+    headers: {
+      "content-type": fileResponse.headers.get("content-type") ?? "application/octet-stream",
+      "cache-control": "private, max-age=300"
+    }
+  });
+}
+
 function getConfig(env: Env): AppConfig {
   if (!env.REVIEW_CHAT_ID) {
     throw new Error("Missing REVIEW_CHAT_ID");
@@ -2159,6 +2394,10 @@ function normalizeForMatch(value: string): string {
   return value.normalize("NFKC").toLowerCase().trim();
 }
 
+function normalizeUsername(value: string): string {
+  return normalizeForMatch(value.replace(/^@+/, ""));
+}
+
 function normalizeRequiredText(value: unknown, errorMessage: string): string {
   if (typeof value !== "string") {
     throw new ApiError(errorMessage);
@@ -2205,6 +2444,85 @@ function normalizeTelegramUserId(value: unknown, errorMessage: string): number {
   }
 
   return normalizedValue;
+}
+
+function normalizeUserBlacklistRule(
+  matchTypeValue: unknown,
+  value: unknown
+): { matchType: UserBlacklistMatchType; value: string; normalizedValue: string } {
+  if (matchTypeValue !== "user_id" && matchTypeValue !== "username" && matchTypeValue !== "full_name") {
+    throw new ApiError("请选择用户黑名单类型。");
+  }
+
+  if (typeof value !== "string") {
+    throw new ApiError("请填写用户黑名单内容。");
+  }
+
+  const trimmedValue = value.trim();
+  if (!trimmedValue) {
+    throw new ApiError("请填写用户黑名单内容。");
+  }
+
+  if (matchTypeValue === "user_id") {
+    const userId = normalizeTelegramUserId(trimmedValue, "用户 ID 必须是数字。");
+    return {
+      matchType: "user_id",
+      value: String(userId),
+      normalizedValue: String(userId)
+    };
+  }
+
+  if (matchTypeValue === "username") {
+    const username = normalizeUsername(trimmedValue);
+    if (!username) {
+      throw new ApiError("用户名不能为空。");
+    }
+
+    return {
+      matchType: "username",
+      value: `@${username}`,
+      normalizedValue: username
+    };
+  }
+
+  return {
+    matchType: "full_name",
+    value: trimmedValue,
+    normalizedValue: normalizeForMatch(trimmedValue)
+  };
+}
+
+function normalizeUserBlacklistCommand(args: string): {
+  matchType: UserBlacklistMatchType;
+  value: string;
+  normalizedValue: string;
+} {
+  try {
+    const trimmedArgs = args.trim();
+    if (/^\d+$/.test(trimmedArgs)) {
+      return normalizeUserBlacklistRule("user_id", trimmedArgs);
+    }
+
+    if (trimmedArgs.startsWith("@")) {
+      return normalizeUserBlacklistRule("username", trimmedArgs);
+    }
+
+    return normalizeUserBlacklistRule("full_name", trimmedArgs);
+  } catch (error) {
+    throw new UserVisibleError(error instanceof Error ? error.message : "用户黑名单内容无效。");
+  }
+}
+
+function formatUserBlacklistRule(matchType: UserBlacklistMatchType, value: string): string {
+  if (matchType === "user_id") {
+    return `用户ID ${value}`;
+  }
+
+  if (matchType === "username") {
+    return `用户名 ${value}`;
+  }
+
+  return `昵称 ${value}`;
 }
 
 function normalizeMiniAppImageDataUrl(value: unknown, sizeValue: unknown): string | null {
@@ -2270,6 +2588,15 @@ function normalizeSubmissionStatus(value: string | null): SubmissionStatus | "al
     : "pending";
 }
 
+function normalizeListLimit(value: string | null): number {
+  if (!value) {
+    return 50;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? Math.min(Math.max(parsed, 1), 100) : 50;
+}
+
 function truncateForTelegram(text: string, limit: number): string {
   if (text.length <= limit) {
     return text;
@@ -2322,6 +2649,20 @@ function serializeAdmin(admin: AdminRow): {
     userId: admin.user_id,
     role: admin.role,
     isSuperadmin: admin.role === "superadmin"
+  };
+}
+
+function serializeUserBlacklistRule(rule: UserBlacklistRow): {
+  id: number;
+  matchType: UserBlacklistMatchType;
+  value: string;
+  label: string;
+} {
+  return {
+    id: rule.id,
+    matchType: rule.match_type,
+    value: rule.value,
+    label: formatUserBlacklistRule(rule.match_type, rule.value)
   };
 }
 
@@ -2753,6 +3094,47 @@ function renderMiniAppHtml(): string {
       color: var(--danger);
     }
 
+    .media-preview {
+      width: 100%;
+      max-height: 360px;
+      object-fit: contain;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      margin-bottom: 12px;
+    }
+
+    .history-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .history-item {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 11px;
+      background: #fff;
+    }
+
+    .history-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .history-text {
+      margin: 0 0 9px;
+      color: var(--ink);
+      line-height: 1.55;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
     .rule-list {
       display: grid;
       gap: 8px;
@@ -2826,10 +3208,15 @@ function renderMiniAppHtml(): string {
       user: null,
       role: { isAdmin: false, isSuperadmin: false },
       submissions: [],
+      history: [],
       reasons: [],
       blacklist: [],
+      userBlacklist: [],
       admins: [],
       settings: { submissionIntervalSeconds: 3600, submissionIntervalMinutes: 60, submissionIntervalText: "1 小时" },
+      mediaUrls: {},
+      mediaLoading: {},
+      mediaErrors: {},
       imageDataUrl: null,
       imageSize: 0,
       imageName: "",
@@ -2852,7 +3239,7 @@ function renderMiniAppHtml(): string {
       return {
         pending: "待审核",
         publishing: "发送中",
-        published: "已发送",
+        published: "发送成功",
         rejected: "已驳回",
         auto_rejected: "自动驳回"
       }[status] || status;
@@ -2874,6 +3261,27 @@ function renderMiniAppHtml(): string {
       return payload;
     }
 
+    async function apiBlob(path) {
+      const response = await fetch(path, {
+        headers: {
+          "authorization": "tma " + initData
+        }
+      });
+
+      if (!response.ok) {
+        let message = "图片读取失败";
+        try {
+          const payload = await response.json();
+          message = payload.error || message;
+        } catch (_) {
+          message = response.statusText || message;
+        }
+        throw new Error(message);
+      }
+
+      return response.blob();
+    }
+
     async function bootstrap() {
       if (!initData) {
         state.loading = false;
@@ -2889,6 +3297,7 @@ function renderMiniAppHtml(): string {
         state.submissions = payload.submissions || [];
         state.reasons = payload.reasons || [];
         state.blacklist = payload.blacklist || [];
+        state.userBlacklist = payload.userBlacklist || [];
         state.admins = payload.admins || [];
         state.settings = payload.settings || state.settings;
         if (state.role.isAdmin) {
@@ -2913,6 +3322,7 @@ function renderMiniAppHtml(): string {
         : "未登录";
       const tabs = state.role.isAdmin
         ? '<button class="tab ' + (state.tab === "review" ? "active" : "") + '" data-action="tab" data-tab="review">审核</button>' +
+          '<button class="tab ' + (state.tab === "history" ? "active" : "") + '" data-action="tab" data-tab="history">历史</button>' +
           '<button class="tab ' + (state.tab === "rules" ? "active" : "") + '" data-action="tab" data-tab="rules">规则</button>'
         : "";
       const roleText = state.role.isAdmin ? "管理员" : "投稿人";
@@ -2941,6 +3351,9 @@ function renderMiniAppHtml(): string {
       if (state.tab === "rules" && state.role.isAdmin) {
         return renderRules();
       }
+      if (state.tab === "history" && state.role.isAdmin) {
+        return renderHistory();
+      }
       if (state.role.isAdmin) {
         return renderReview();
       }
@@ -2968,6 +3381,7 @@ function renderMiniAppHtml(): string {
       if (selected && state.selectedId !== selected.id) {
         state.selectedId = selected.id;
       }
+      scheduleMediaLoad(selected);
 
       const list = state.submissions.length
         ? state.submissions.map(renderSubmissionItem).join("")
@@ -2998,12 +3412,62 @@ function renderMiniAppHtml(): string {
         return '<div class="empty">选择一条投稿</div>';
       }
 
-      const mediaHint = item.contentType === "photo" ? '<div class="message show ok">这条投稿包含配图，发送时会一并发送到频道。</div>' : '';
-      return mediaHint +
+      return renderMediaPreview(item) +
         '<div class="field"><label for="reviewText">投稿文案</label><textarea id="reviewText" maxlength="3800">' + escapeHtml(item.contentText || "") + '</textarea></div>' +
         '<div class="toolbar">' +
           '<button class="btn primary" data-action="publish-reviewed" ' + (state.busy ? "disabled" : "") + '>发送</button>' +
         '</div>';
+    }
+
+    function renderMediaPreview(item) {
+      if (!item || item.contentType !== "photo") {
+        return "";
+      }
+
+      if (item.mediaCleared || !item.hasMedia) {
+        return '<div class="message show err">这条投稿的图片已清理，仅保留文字记录。</div>';
+      }
+
+      if (state.mediaUrls[item.id]) {
+        return '<img class="media-preview" src="' + state.mediaUrls[item.id] + '" alt="投稿配图">';
+      }
+
+      if (state.mediaErrors[item.id]) {
+        return '<div class="message show err">' + escapeHtml(state.mediaErrors[item.id]) + '</div>';
+      }
+
+      return '<div class="message show ok">图片加载中...</div>';
+    }
+
+    function renderHistory() {
+      const list = state.history.length
+        ? state.history.map(renderHistoryItem).join("")
+        : '<div class="empty">暂无历史记录，点击刷新获取。</div>';
+
+      return '<section class="panel">' +
+        '<div class="panel-header"><h2>历史记录</h2><button class="btn ghost" data-action="refresh-history">刷新</button></div>' +
+        '<div class="panel-body"><div class="history-list">' + list + '</div></div>' +
+      '</section>';
+    }
+
+    function renderHistoryItem(item) {
+      const text = item.editedText || item.contentText || "无正文";
+      const username = item.username ? " @" + escapeHtml(item.username) : "";
+      const reason = item.rejectionReason ? '<div class="message show err">驳回理由：' + escapeHtml(item.rejectionReason) + '</div>' : '';
+      const mediaText = item.contentType === "photo"
+        ? (item.mediaCleared ? " · 图片已清理" : " · 含配图")
+        : "";
+      const blacklistButtons =
+        '<button class="btn ghost" data-action="blacklist-user" data-type="user_id" data-value="' + item.userId + '">拉黑ID</button>' +
+        (item.username ? '<button class="btn ghost" data-action="blacklist-user" data-type="username" data-value="@' + escapeHtml(item.username) + '">拉黑用户名</button>' : '') +
+        '<button class="btn ghost" data-action="blacklist-user" data-type="full_name" data-value="' + escapeHtml(item.author) + '">拉黑昵称</button>';
+
+      return '<article class="history-item">' +
+        '<div class="history-meta"><span>#' + item.id + ' · ' + escapeHtml(item.author) + username + ' · 用户ID ' + item.userId + mediaText + '</span><span class="status ' + item.status + '">' + statusLabel(item.status) + '</span></div>' +
+        '<p class="history-text">' + escapeHtml(text) + '</p>' +
+        reason +
+        '<div class="toolbar">' + blacklistButtons + '</div>' +
+      '</article>';
     }
 
     function renderRules() {
@@ -3012,17 +3476,24 @@ function renderMiniAppHtml(): string {
         : '<div class="message show ok">只有超级管理员可以新增或删除管理员。</div>';
       return '<section class="grid">' +
         '<div class="panel">' +
+          '<div class="panel-header"><h2>正文黑名单</h2></div>' +
+          '<div class="panel-body">' +
+            '<div class="item-row"><input id="newKeyword" placeholder="新增关键词"><button class="btn primary" data-action="add-keyword">添加</button></div>' +
+            '<div class="rule-list">' + renderRuleList(state.blacklist, "delete-keyword") + '</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="panel">' +
+          '<div class="panel-header"><h2>用户黑名单</h2></div>' +
+          '<div class="panel-body">' +
+            '<div class="item-row"><select id="newUserBlacklistType"><option value="user_id">用户ID</option><option value="username">用户名</option><option value="full_name">昵称</option></select><input id="newUserBlacklistValue" placeholder="精确匹配内容"><button class="btn primary" data-action="add-user-blacklist">添加</button></div>' +
+            '<div class="rule-list">' + renderUserBlacklistList() + '</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="panel">' +
           '<div class="panel-header"><h2>驳回理由</h2></div>' +
           '<div class="panel-body">' +
             '<div class="item-row"><input id="newReason" placeholder="新增驳回理由"><button class="btn primary" data-action="add-reason">添加</button></div>' +
             '<div class="rule-list">' + renderRuleList(state.reasons, "delete-reason") + '</div>' +
-          '</div>' +
-        '</div>' +
-        '<div class="panel">' +
-          '<div class="panel-header"><h2>黑名单</h2></div>' +
-          '<div class="panel-body">' +
-            '<div class="item-row"><input id="newKeyword" placeholder="新增关键词"><button class="btn primary" data-action="add-keyword">添加</button></div>' +
-            '<div class="rule-list">' + renderRuleList(state.blacklist, "delete-keyword") + '</div>' +
           '</div>' +
         '</div>' +
         '<div class="panel">' +
@@ -3049,6 +3520,16 @@ function renderMiniAppHtml(): string {
       return items.map(function (item) {
         const text = item.reason || item.keyword;
         return '<div class="rule-item"><span>' + escapeHtml(text) + '</span><button class="btn ghost" data-action="' + action + '" data-id="' + item.id + '">删除</button></div>';
+      }).join("");
+    }
+
+    function renderUserBlacklistList() {
+      if (!state.userBlacklist.length) {
+        return '<div class="empty">暂无记录</div>';
+      }
+
+      return state.userBlacklist.map(function (item) {
+        return '<div class="rule-item"><span>' + escapeHtml(item.label) + '</span><button class="btn ghost" data-action="delete-user-blacklist" data-id="' + item.id + '">删除</button></div>';
       }).join("");
     }
 
@@ -3085,6 +3566,40 @@ function renderMiniAppHtml(): string {
       state.submissions = payload.submissions || [];
       if (!state.submissions.some(function (item) { return item.id === state.selectedId; })) {
         state.selectedId = state.submissions[0] ? state.submissions[0].id : null;
+      }
+    }
+
+    async function refreshHistory() {
+      const payload = await api("/api/submissions?status=all&limit=100");
+      state.history = (payload.submissions || []).filter(function (item) {
+        return item.status !== "pending" && item.status !== "publishing";
+      });
+    }
+
+    function scheduleMediaLoad(item) {
+      if (!item || item.contentType !== "photo" || !item.hasMedia || item.mediaCleared || state.mediaUrls[item.id] || state.mediaLoading[item.id] || state.mediaErrors[item.id]) {
+        return;
+      }
+
+      state.mediaLoading[item.id] = true;
+      setTimeout(function () {
+        loadSubmissionMedia(item.id);
+      }, 0);
+    }
+
+    async function loadSubmissionMedia(submissionId) {
+      try {
+        const blob = await apiBlob("/api/submissions/" + submissionId + "/media");
+        if (state.mediaUrls[submissionId]) {
+          URL.revokeObjectURL(state.mediaUrls[submissionId]);
+        }
+        state.mediaUrls[submissionId] = URL.createObjectURL(blob);
+        delete state.mediaErrors[submissionId];
+      } catch (error) {
+        state.mediaErrors[submissionId] = error.message;
+      } finally {
+        state.mediaLoading[submissionId] = false;
+        render();
       }
     }
 
@@ -3171,6 +3686,11 @@ function renderMiniAppHtml(): string {
         state.tab = target.dataset.tab || "submit";
         state.flash = null;
         render();
+        if (state.tab === "history") {
+          withBusy(async function () {
+            await refreshHistory();
+          });
+        }
         return;
       }
 
@@ -3184,6 +3704,14 @@ function renderMiniAppHtml(): string {
         withBusy(async function () {
           await refreshPending();
           state.flash = { type: "ok", text: "已刷新" };
+        });
+        return;
+      }
+
+      if (action === "refresh-history") {
+        withBusy(async function () {
+          await refreshHistory();
+          state.flash = { type: "ok", text: "已刷新历史记录" };
         });
         return;
       }
@@ -3263,6 +3791,41 @@ function renderMiniAppHtml(): string {
           const payload = await api("/api/blacklist/" + target.dataset.id, { method: "DELETE" });
           state.blacklist = payload.blacklist || [];
           state.flash = { type: "ok", text: "已删除关键词" };
+        });
+        return;
+      }
+
+      if (action === "add-user-blacklist") {
+        const matchType = document.getElementById("newUserBlacklistType").value;
+        const value = document.getElementById("newUserBlacklistValue").value;
+        withBusy(async function () {
+          const payload = await api("/api/user-blacklist", {
+            method: "POST",
+            body: JSON.stringify({ matchType: matchType, value: value })
+          });
+          state.userBlacklist = payload.userBlacklist || [];
+          state.flash = { type: "ok", text: "已添加用户黑名单" };
+        });
+        return;
+      }
+
+      if (action === "delete-user-blacklist") {
+        withBusy(async function () {
+          const payload = await api("/api/user-blacklist/" + target.dataset.id, { method: "DELETE" });
+          state.userBlacklist = payload.userBlacklist || [];
+          state.flash = { type: "ok", text: "已删除用户黑名单" };
+        });
+        return;
+      }
+
+      if (action === "blacklist-user") {
+        withBusy(async function () {
+          const payload = await api("/api/user-blacklist", {
+            method: "POST",
+            body: JSON.stringify({ matchType: target.dataset.type, value: target.dataset.value })
+          });
+          state.userBlacklist = payload.userBlacklist || [];
+          state.flash = { type: "ok", text: "已加入用户黑名单" };
         });
         return;
       }
