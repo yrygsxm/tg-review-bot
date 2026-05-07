@@ -659,11 +659,20 @@ async function handleCallbackQuery(
         await publishSubmission(env, submission, callbackQuery.from.id, null, config);
         return;
       }
+      case "confirm_edit_publish": {
+        if (!submission.edited_text) {
+          throw new UserVisibleError("还没有可确认的修改文案，请先点击“修改后发送”。");
+        }
+
+        await answerCallbackQuery(env, callbackQuery.id, "正在发送修改后的内容…");
+        await publishSubmission(env, submission, callbackQuery.from.id, submission.edited_text, config);
+        return;
+      }
       case "edit": {
         const prompt = await sendMessage(
           env,
           message.chat.id,
-          `请回复这条消息发送修改后的内容。\n如果原稿带有媒体，这里只会替换频道里的文案，不会替换媒体文件。\n投稿编号：#${submissionId}`
+          `请直接发送修改后的内容。\n如果原稿带有媒体，这里只会替换频道里的文案，不会替换媒体文件。\n发送 /cancel 可取消。\n投稿编号：#${submissionId}`
         );
         await upsertAdminSession(
           env,
@@ -674,6 +683,16 @@ async function handleCallbackQuery(
           prompt.message_id
         );
         await answerCallbackQuery(env, callbackQuery.id, "请回复刚才的提示消息。");
+        return;
+      }
+      case "clear_edit": {
+        await env.DB.prepare(
+          "UPDATE submissions SET edited_text = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'"
+        )
+          .bind(submissionId)
+          .run();
+        await answerCallbackQuery(env, callbackQuery.id, "已取消修改。");
+        await sendMessage(env, message.chat.id, `投稿 #${submissionId} 的待确认修改已取消。`);
         return;
       }
       case "manual_reject": {
@@ -723,6 +742,11 @@ async function handleCallbackQuery(
     }
   } catch (error) {
     const messageText = error instanceof UserVisibleError ? error.message : "操作失败，请稍后重试。";
+    if (message) {
+      await safelyRun("notify admin action failure", () =>
+        sendMessage(env, message.chat.id, `操作失败：${messageText}`).then(() => undefined)
+      );
+    }
     await answerCallbackQuery(env, callbackQuery.id, messageText, true);
   }
 }
@@ -825,13 +849,6 @@ async function handleAdminSessionMessage(
     return;
   }
 
-  if (
-    adminSession.prompt_message_id &&
-    message.reply_to_message?.message_id !== adminSession.prompt_message_id
-  ) {
-    return;
-  }
-
   const submission = await getSubmission(env, adminSession.submission_id);
   if (!submission) {
     await deleteAdminSession(env, actor.id);
@@ -852,7 +869,17 @@ async function handleAdminSessionMessage(
     }
     case "edit_submission": {
       await deleteAdminSession(env, actor.id);
-      await publishSubmission(env, submission, actor.id, rawText, config);
+      await env.DB.prepare(
+        "UPDATE submissions SET edited_text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'"
+      )
+        .bind(rawText, submission.id)
+        .run();
+      await sendMessage(
+        env,
+        message.chat.id,
+        formatEditConfirmationMessage(submission, rawText),
+        buildEditConfirmationKeyboard(submission.id)
+      );
       return;
     }
   }
@@ -964,9 +991,13 @@ async function publishSubmission(
     throw error;
   }
 
-  await safelyRun("notify approval", () => notifyUserApproval(env, submission));
+  const notified = await safelyRun("notify approval", () => notifyUserApproval(env, submission));
   await safelyRun("refresh review message after publish", () =>
-    refreshReviewMessage(env, submission.id, "已发送到频道")
+    refreshReviewMessage(
+      env,
+      submission.id,
+      notified ? "已发送到频道\n投稿者通知：成功" : "已发送到频道\n投稿者通知：失败，请确认用户已私聊机器人 /start"
+    )
   );
 }
 
@@ -986,9 +1017,16 @@ async function rejectSubmission(
     throw new UserVisibleError("这条投稿已经被其他管理员处理了。");
   }
 
-  await safelyRun("notify rejection", () => notifyUserRejection(env, submission, reason));
+  const notified = await safelyRun("notify rejection", () => notifyUserRejection(env, submission, reason));
   await safelyRun("refresh review message after rejection", () =>
-    refreshReviewMessage(env, submission.id, reason ? `已驳回\n理由：${reason}` : "已驳回")
+    refreshReviewMessage(
+      env,
+      submission.id,
+      [
+        reason ? `已驳回\n理由：${reason}` : "已驳回",
+        notified ? "投稿者通知：成功" : "投稿者通知：失败，请确认用户已私聊机器人 /start"
+      ].join("\n")
+    )
   );
 }
 
@@ -1082,6 +1120,20 @@ function formatReviewMessage(submission: SubmissionRow, statusLine = "待审核"
   const limit = submission.content_type === "text" ? 4096 : 1024;
 
   return truncateForTelegram(`${header}\n${contentFallback}`, limit);
+}
+
+function formatEditConfirmationMessage(submission: SubmissionRow, editedText: string): string {
+  return truncateForTelegram(
+    [
+      `【确认修改 #${submission.id}】`,
+      `投稿人：${submission.full_name}${submission.username ? ` (@${submission.username})` : ""}`,
+      `署名：${submission.display_sender ? "显示" : "匿名"}`,
+      "",
+      "修改后内容：",
+      editedText
+    ].join("\n"),
+    submission.content_type === "text" ? 4096 : 1024
+  );
 }
 
 async function sendSubmissionToReviewChat(
@@ -1493,6 +1545,18 @@ function buildApprovalMenuKeyboard(submissionId: number): InlineKeyboardMarkup {
   };
 }
 
+function buildEditConfirmationKeyboard(submissionId: number): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: "确认发送修改版", callback_data: `a:${submissionId}:confirm_edit_publish` }],
+      [
+        { text: "重新修改", callback_data: `a:${submissionId}:edit` },
+        { text: "取消修改", callback_data: `a:${submissionId}:clear_edit` }
+      ]
+    ]
+  };
+}
+
 function buildRejectMenuKeyboard(
   submissionId: number,
   reasons: RejectionReasonRow[]
@@ -1851,9 +1915,10 @@ function requireArgument(args: string, message: string): asserts args is string 
   }
 }
 
-async function safelyRun(label: string, action: () => Promise<void>): Promise<void> {
+async function safelyRun(label: string, action: () => Promise<void>): Promise<boolean> {
   try {
     await action();
+    return true;
   } catch (error) {
     console.error(
       JSON.stringify({
@@ -1862,6 +1927,7 @@ async function safelyRun(label: string, action: () => Promise<void>): Promise<vo
         error: error instanceof Error ? error.message : String(error)
       })
     );
+    return false;
   }
 }
 
