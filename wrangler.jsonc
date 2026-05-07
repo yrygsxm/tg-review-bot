@@ -17,6 +17,8 @@
     {
       "binding": "DB",
       "database_name": "tg-review-bot",
+      // Replace this with the real D1 Database ID from Cloudflare Dashboard
+      // before deploying with Workers Builds.
       "database_id": "__REPLACE_WITH_D1_DATABASE_ID__"
     }
   ]

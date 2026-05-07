@@ -32,13 +32,21 @@
 
 推荐使用 Cloudflare Dashboard 的 Git 集成部署。Cloudflare 官方 Workers Builds 支持连接 GitHub/GitLab 仓库，并在代码更新后自动构建和部署 Worker。
 
+第一次部署前必须先完成 D1 数据库配置。当前项目通过 [wrangler.jsonc](/Users/simon/Documents/tg 投稿审核机器人/wrangler.jsonc) 声明 D1 绑定，Cloudflare 构建时会读取这里的 `database_id`。如果 `database_id` 还是占位值，构建会报错：
+
+`binding DB of type d1 must have a valid database_id specified`
+
 1. 打开 Cloudflare Dashboard。
-2. 进入 `Workers & Pages`。
-3. 选择创建 Worker，并连接保存本项目的 GitHub 或 GitLab 仓库。
-4. 项目名称使用 `tg-review-bot`，需要和 [wrangler.jsonc](/Users/simon/Documents/tg 投稿审核机器人/wrangler.jsonc) 里的 `name` 保持一致。
-5. 确认根目录指向本项目所在目录。
-6. 保存后让 Cloudflare 自动完成第一次部署。
-7. 部署完成后，记录 Worker 访问地址，例如 `https://tg-review-bot.xxx.workers.dev`。
+2. 先进入 `Storage & Databases` 创建 D1 数据库。
+3. 记录 D1 数据库的 `Database ID`。
+4. 在 GitHub 仓库里打开 `wrangler.jsonc`，把 `__REPLACE_WITH_D1_DATABASE_ID__` 替换成真实的 `Database ID`。
+5. 提交这个修改。
+6. 回到 Cloudflare Dashboard，进入 `Workers & Pages`。
+7. 选择创建 Worker，并连接保存本项目的 GitHub 或 GitLab 仓库。
+8. 项目名称使用 `tg-review-bot`，需要和 [wrangler.jsonc](/Users/simon/Documents/tg 投稿审核机器人/wrangler.jsonc) 里的 `name` 保持一致。
+9. 确认根目录指向本项目所在目录。
+10. 保存后让 Cloudflare 自动完成第一次部署。
+11. 部署完成后，记录 Worker 访问地址，例如 `https://tg-review-bot.xxx.workers.dev`。
 
 Cloudflare 官方说明：
 [Workers Builds](https://developers.cloudflare.com/workers/ci-cd/builds/)
@@ -48,10 +56,12 @@ Cloudflare 官方说明：
 
 1. 在 Cloudflare Dashboard 进入 `Storage & Databases`。
 2. 创建一个 D1 数据库，名称建议使用 `tg-review-bot`。
-3. 打开数据库的控制台或查询页面。
-4. 打开 [migrations/0001_init.sql](/Users/simon/Documents/tg 投稿审核机器人/migrations/0001_init.sql)，把里面的表结构放到 D1 查询页面执行。
-5. 回到 Worker 的设置页，在 `Bindings` 里添加 D1 绑定。
-6. 绑定名称填写 `DB`，数据库选择刚创建的 `tg-review-bot`。
+3. 复制数据库的 `Database ID`。
+4. 在 GitHub 仓库编辑 `wrangler.jsonc`，把 `database_id` 的占位值替换成真实 ID。
+5. 打开数据库的控制台或查询页面。
+6. 打开 [migrations/0001_init.sql](/Users/simon/Documents/tg 投稿审核机器人/migrations/0001_init.sql)，把里面的表结构放到 D1 查询页面执行。
+
+说明：这个项目不依赖手动在 Worker 设置页添加 D1 Binding。D1 Binding 已经写在 `wrangler.jsonc` 里，绑定名称是 `DB`。关键是 `database_id` 必须是真实值。
 
 ## 环境变量和密钥
 
