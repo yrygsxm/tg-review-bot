@@ -1,0 +1,18 @@
+{
+  "name": "tg-review-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "cf-typegen": "wrangler types",
+    "check": "npm run cf-typegen && tsc --noEmit",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "set-webhook": "node ./scripts/set-webhook.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.49.0"
+  }
+}

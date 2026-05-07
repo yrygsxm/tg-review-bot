@@ -1,0 +1,2 @@
+TELEGRAM_BOT_TOKEN=123456:replace-me
+TELEGRAM_WEBHOOK_SECRET=replace_me_with_a_random_token

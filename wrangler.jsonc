@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "tg-review-bot",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-07",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "REVIEW_CHAT_ID": "123456789",
+    "TARGET_CHANNEL_ID": "@your_channel",
+    "MINI_APP_URL": "https://your-worker.workers.dev/app",
+    "SUPERADMIN_IDS": "123456789"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "tg-review-bot",
+      "database_id": "__REPLACE_WITH_D1_DATABASE_ID__"
+    }
+  ]
+}
