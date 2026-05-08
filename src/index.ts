@@ -3205,6 +3205,7 @@ function renderMiniAppHtml(): string {
       busy: false,
       tab: "submit",
       selectedId: null,
+      rejectingId: null,
       user: null,
       role: { isAdmin: false, isSuperadmin: false },
       submissions: [],
@@ -3416,6 +3417,27 @@ function renderMiniAppHtml(): string {
         '<div class="field"><label for="reviewText">投稿文案</label><textarea id="reviewText" maxlength="3800">' + escapeHtml(item.contentText || "") + '</textarea></div>' +
         '<div class="toolbar">' +
           '<button class="btn primary" data-action="publish-reviewed" ' + (state.busy ? "disabled" : "") + '>发送</button>' +
+          '<button class="btn danger" data-action="show-reject" ' + (state.busy ? "disabled" : "") + '>驳回</button>' +
+        '</div>' +
+        renderRejectPanel(item);
+    }
+
+    function renderRejectPanel(item) {
+      if (!item || state.rejectingId !== item.id) {
+        return "";
+      }
+
+      const reasonOptions = ['<option value="">无理由驳回</option>']
+        .concat(state.reasons.map(function (reason) {
+          return '<option value="' + escapeHtml(reason.reason) + '">' + escapeHtml(reason.reason) + '</option>';
+        }))
+        .join("");
+
+      return '<div class="field" style="margin-top:12px"><label for="rejectReason">驳回理由</label><select id="rejectReason">' + reasonOptions + '</select></div>' +
+        '<div class="field"><label for="rejectManualReason">手动填写理由（可选，优先于上方选择）</label><input id="rejectManualReason" maxlength="300" placeholder="例如：来源不明"></div>' +
+        '<div class="toolbar">' +
+          '<button class="btn danger" data-action="confirm-reject" ' + (state.busy ? "disabled" : "") + '>确认驳回</button>' +
+          '<button class="btn ghost" data-action="cancel-reject">取消</button>' +
         '</div>';
     }
 
@@ -3696,6 +3718,7 @@ function renderMiniAppHtml(): string {
 
       if (action === "select") {
         state.selectedId = Number(target.dataset.id);
+        state.rejectingId = null;
         render();
         return;
       }
@@ -3747,6 +3770,36 @@ function renderMiniAppHtml(): string {
           });
           await refreshPending();
           state.flash = { type: "ok", text: "已发送到频道" };
+        });
+        return;
+      }
+
+      if (action === "show-reject") {
+        state.rejectingId = state.selectedId;
+        state.flash = null;
+        render();
+        return;
+      }
+
+      if (action === "cancel-reject") {
+        state.rejectingId = null;
+        state.flash = null;
+        render();
+        return;
+      }
+
+      if (action === "confirm-reject") {
+        const submissionId = state.selectedId;
+        const manualReason = document.getElementById("rejectManualReason").value.trim();
+        const selectedReason = document.getElementById("rejectReason").value;
+        withBusy(async function () {
+          await api("/api/submissions/" + submissionId + "/reject", {
+            method: "POST",
+            body: JSON.stringify({ reason: manualReason || selectedReason || null })
+          });
+          state.rejectingId = null;
+          await refreshPending();
+          state.flash = { type: "ok", text: "已驳回" };
         });
         return;
       }
